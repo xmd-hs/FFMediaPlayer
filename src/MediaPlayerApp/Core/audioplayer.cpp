@@ -4,8 +4,11 @@
 #include <iostream>
 #include <thread>
 #include <chrono>
-#include <QCoreApplication>
 using namespace std;
+
+extern "C" {
+#include <libavutil/log.h>
+}
 
 #include <QAudioOutput>
 #include <QAudioDeviceInfo>
@@ -18,9 +21,12 @@ public:
 	{
 		Close();
 
-		cout << "[Audio] Library paths:" << endl;
-		for (const auto &p : QCoreApplication::libraryPaths())
-			cout << "  " << p.toStdString() << endl;
+		static std::once_flag logFlag;
+		std::call_once(logFlag, []() {
+			av_log_set_level(AV_LOG_ERROR);
+		});
+
+		cout << "[Audio] Opening audio device..." << endl;
 
 		QAudioFormat fmt;
 		fmt.setSampleRate(sampleRate);
@@ -30,40 +36,49 @@ public:
 		fmt.setSampleType(QAudioFormat::SignedInt);
 		fmt.setCodec("audio/pcm");
 
-		QList<QAudioDeviceInfo> devices = QAudioDeviceInfo::availableDevices(QAudio::AudioOutput);
-		cout << "[Audio] Available output devices: " << devices.size() << endl;
-		for (const auto &dev : devices)
-			cout << "  - " << dev.deviceName().toStdString() << endl;
-
 		QAudioDeviceInfo devInfo = QAudioDeviceInfo::defaultOutputDevice();
-		if (devInfo.isNull() && !devices.isEmpty())
+		if (!devInfo.isNull())
 		{
-			cout << "[Audio] Default device null, using first available" << endl;
-			devInfo = devices.first();
+			cout << "[Audio] Using default device: " << devInfo.deviceName().toStdString() << endl;
 		}
-
-		if (devInfo.isNull())
+		else
 		{
-			cout << "[Audio] ERROR: No audio output device available!" << endl;
-			return false;
+			QList<QAudioDeviceInfo> devices = QAudioDeviceInfo::availableDevices(QAudio::AudioOutput);
+			if (!devices.isEmpty())
+			{
+				devInfo = devices.first();
+				cout << "[Audio] Using first available: " << devInfo.deviceName().toStdString() << endl;
+			}
+			else
+			{
+				cout << "[Audio] ERROR: No audio output device!" << endl;
+				return false;
+			}
 		}
-
-		cout << "[Audio] Using device: " << devInfo.deviceName().toStdString() << endl;
 
 		if (!devInfo.isFormatSupported(fmt))
 		{
-			cout << "[Audio] S16LE not supported, trying nearest..." << endl;
 			fmt = devInfo.nearestFormat(fmt);
 		}
 
 		mux.lock();
 		output = new QAudioOutput(devInfo, fmt);
-		int bufSize = sampleRate * channels * 2 / 2;
+		int bufSize = sampleRate * channels;
 		if (bufSize < 8192) bufSize = 8192;
 		output->setBufferSize(bufSize);
 		io = output->start();
-		playStartElapsed = 0;
+		playStartElapsed = output->elapsedUSecs() / 1000;
 		mux.unlock();
+
+		if (!io)
+		{
+			cout << "[Audio] ERROR: output->start() returned null!" << endl;
+			mux.lock();
+			delete output;
+			output = nullptr;
+			mux.unlock();
+			return false;
+		}
 
 		cout << "Audio opened, bufsize=" << bufSize << " sr=" << sampleRate << " ch=" << channels << endl;
 		return true;
@@ -90,28 +105,26 @@ public:
 
 	void Clear() override
 	{
-		mux.lock();
+		std::lock_guard<std::mutex> lk(mux);
 		if (output)
 		{
 			output->reset();
 			io = output->start();
 			playStartElapsed = 0;
 		}
-		mux.unlock();
 	}
 
 	long long GetPlayedMs() override
 	{
-		mux.lock();
+		std::lock_guard<std::mutex> lk(mux);
 		long long playedMs = 0;
 		if (output && io && sampleRate > 0 && channels > 0)
 		{
-			long long elapsedMs = output->elapsedUSecs() / 1000;
 			long long processedMs = output->processedUSecs() / 1000;
-			playedMs = std::min(elapsedMs, processedMs) - playStartElapsed;
+			playedMs = processedMs - playStartElapsed;
 			if (playedMs < 0) playedMs = 0;
+			if (playedMs > 3600000) playedMs = 0; // 防止异常值
 		}
-		mux.unlock();
 		return playedMs;
 	}
 
@@ -149,7 +162,7 @@ public:
 
 	void SetPause(bool isPause) override
 	{
-		mux.lock();
+		std::lock_guard<std::mutex> lk(mux);
 		if (output)
 		{
 			if (isPause) output->suspend();
@@ -159,7 +172,6 @@ public:
 				else output->resume();
 			}
 		}
-		mux.unlock();
 	}
 
 	void SetVolume(int volume) override

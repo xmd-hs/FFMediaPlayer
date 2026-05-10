@@ -6,15 +6,8 @@ namespace Kama_memoryPool
 
 void* ThreadCache::allocate(size_t size)
 {
-    if (size == 0)
-    {
-        size = ALIGNMENT;
-    }
-
-    if (size > MAX_BYTES)
-    {
-        return malloc(size);
-    }
+    if (size == 0) size = ALIGNMENT;
+    if (size > MAX_BYTES) return malloc(size);
 
     size_t index = SizeClass::getIndex(size);
 
@@ -30,17 +23,12 @@ void* ThreadCache::allocate(size_t size)
 
 void ThreadCache::deallocate(void* ptr, size_t size)
 {
-    if (size > MAX_BYTES)
-    {
-        free(ptr);
-        return;
-    }
+    if (size > MAX_BYTES) { free(ptr); return; }
 
     size_t index = SizeClass::getIndex(size);
 
     *reinterpret_cast<void**>(ptr) = freeList_[index];
     freeList_[index] = ptr;
-
     freeListSize_[index]++;
 
     if (shouldReturnToCentralCache(index))
@@ -51,8 +39,7 @@ void ThreadCache::deallocate(void* ptr, size_t size)
 
 bool ThreadCache::shouldReturnToCentralCache(size_t index)
 {
-    size_t threshold = 64;
-    return (freeListSize_[index] > threshold);
+    return freeListSize_[index] > 64;
 }
 
 void* ThreadCache::fetchFromCentralCache(size_t index)
@@ -107,7 +94,6 @@ void ThreadCache::returnToCentralCache(void* start, size_t size)
         *reinterpret_cast<void**>(splitNode) = nullptr;
 
         freeList_[index] = start;
-
         freeListSize_[index] = keepNum;
 
         if (returnNum > 0 && nextNode != nullptr)
@@ -131,7 +117,6 @@ size_t ThreadCache::getBatchNum(size_t size)
     else baseNum = 1;
 
     size_t maxNum = std::max(size_t(1), MAX_BATCH_SIZE / size);
-
     return std::max(size_t(1), std::min(maxNum, baseNum));
 }
 
@@ -147,4 +132,4 @@ ThreadCache::~ThreadCache()
     }
 }
 
-} // namespace memoryPool
+} // namespace Kama_memoryPool

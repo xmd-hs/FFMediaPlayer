@@ -8,9 +8,9 @@ class AudioResampler;
 class AudioThread : public DecodeThread
 {
 public:
-	long long pts = 0;
+	std::atomic<long long> pts = {0};
 	long long audioStartPts = 0;
-	bool firstFrame = true;
+	std::atomic_bool firstFrame = {true};
 	bool Open(AVCodecParameters *para, int sampleRate, int channels);
 	void Close() override;
 	void Clear() override;

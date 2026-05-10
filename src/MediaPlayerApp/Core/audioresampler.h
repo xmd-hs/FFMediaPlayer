@@ -5,7 +5,7 @@ struct AVFrame;
 struct SwrContext;
 struct AVChannelLayout;
 #include <mutex>
-#include <vector>
+#include <atomic>
 extern "C" {
 #include <libavutil/samplefmt.h>
 }
@@ -30,6 +30,7 @@ protected:
 	AVChannelLayout *inChLayout = nullptr;
 	AVSampleFormat inFmt = AV_SAMPLE_FMT_S16;
 	double curSpeed = 1.0;
-	std::vector<uint8_t> tempBuffer;
+	unsigned char *tempBuf_ = nullptr;
+	size_t tempBufSize_ = 0;
 	bool rebuildCtx();
 };

@@ -3,6 +3,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 }
 #include <iostream>
+#include <thread>
 using namespace std;
 
 void XFreePacket(AVPacket **pkt)
@@ -48,7 +49,7 @@ bool MediaDecoder::Open(AVCodecParameters *para)
 	codec_ = avcodec_alloc_context3(vcodec);
 	avcodec_parameters_to_context(codec_, para);
 	avcodec_parameters_free(&para);
-	codec_->thread_count = 8;
+	codec_->thread_count = (int)std::thread::hardware_concurrency();
 
 	int re = avcodec_open2(codec_, 0, 0);
 	if (re != 0)
@@ -63,17 +64,32 @@ bool MediaDecoder::Open(AVCodecParameters *para)
 	return true;
 }
 
+void MediaDecoder::SetPacketRecycler(std::function<void(AVPacket*)> recycler)
+{
+	packetRecycler_ = std::move(recycler);
+}
+
 bool MediaDecoder::Send(AVPacket *pkt)
 {
 	if (!pkt || pkt->size <= 0 || !pkt->data)
 	{
-		if (pkt) av_packet_free(&pkt);
+		if (pkt)
+		{
+			if (packetRecycler_) packetRecycler_(pkt);
+			else av_packet_free(&pkt);
+		}
 		return false;
 	}
 	std::lock_guard<std::mutex> lk(mux);
-	if (!codec_) { av_packet_free(&pkt); return false; }
+	if (!codec_)
+	{
+		if (packetRecycler_) packetRecycler_(pkt);
+		else av_packet_free(&pkt);
+		return false;
+	}
 	int re = avcodec_send_packet(codec_, pkt);
-	av_packet_free(&pkt);
+	if (packetRecycler_) packetRecycler_(pkt);
+	else av_packet_free(&pkt);
 	return re == 0;
 }
 

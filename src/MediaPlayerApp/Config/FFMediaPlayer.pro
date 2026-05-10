@@ -16,7 +16,8 @@ INCLUDEPATH += ./GeneratedFiles \
     ../Core \
     ../Thread \
     ../../ThreadPool \
-    ../../MemoryPool
+    ../../MemoryPool \
+    ../../LockFree
 
 DEPENDPATH += .
 
@@ -38,7 +39,7 @@ win32 {
         UI_DIR = ../../../build/win64/release/ui
         DEFINES += NDEBUG
     }
-    LIBS += -L"./../../../lib/win64"
+    LIBS += -L"./../../../lib/win64/release"
     RC_FILE += FFMediaPlayer.rc
 }
 
@@ -59,12 +60,16 @@ unix {
         UI_DIR = ../../../build/linux64/release/ui
         DEFINES += NDEBUG
     }
-    LIBS += -L"./../../../lib/linux64"
+    LIBS += -L"./../../../lib/linux64/release"
     QMAKE_RPATHDIR += \$ORIGIN
     QMAKE_LFLAGS += -Wl,--no-as-needed
 }
 
 LIBS += -lavcodec -lavformat -lavutil -lswresample -lswscale -lavfilter -lavdevice -lpostproc
+
+unix {
+    LIBS += -latomic
+}
 
 msvc {
     QMAKE_CXXFLAGS += /utf-8

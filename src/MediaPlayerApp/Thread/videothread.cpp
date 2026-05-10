@@ -1,16 +1,28 @@
 #include "videothread.h"
 #include "mediadecoder.h"
 #include <iostream>
-#include <algorithm>
 extern "C" {
 #include <libavutil/frame.h>
+#include <libavcodec/avcodec.h>
 }
 using namespace std;
 
 VideoThread::VideoThread() {}
 VideoThread::~VideoThread() { Close(); }
 
-long long VideoThread::getPts() { return decode->getPts(); }
+void VideoThread::Close()
+{
+	isExit = true;
+	DecodeThread::Close();
+	if (repaintFuture_.valid()) repaintFuture_.get();
+}
+
+long long VideoThread::getPts()
+{
+	std::lock_guard<std::mutex> lk(mux);
+	if (!decode) return 0;
+	return decode->getPts();
+}
 
 void VideoThread::Clear()
 {
@@ -67,18 +79,19 @@ void VideoThread::run()
 		AVPacket *pkt = Pop();
 		if (!pkt) { msleep(1); continue; }
 
-		long long audioPts;
-		bool curFirstFrame;
-		{
-			std::lock_guard<std::mutex> lk(vmux);
-			audioPts = synpts;
-			curFirstFrame = firstFrame;
-		}
+		long long audioPts = synpts.load();
+		bool curFirstFrame = firstFrame.load();
 
 		{
 			std::lock_guard<std::mutex> lk(mux);
-			if (!decode || !decode->Send(pkt))
+			if (!decode)
 			{
+				RecyclePacket(pkt);
+				continue;
+			}
+			if (!decode->Send(pkt))
+			{
+				RecyclePacket(pkt);
 				continue;
 			}
 		}
@@ -114,56 +127,12 @@ void VideoThread::run()
 					}
 					else if (diff >= -200)
 					{
-						long long curLastPts;
-						steady_clock::time_point curLastFrameTime;
-						{
-							std::lock_guard<std::mutex> lk(vmux);
-							curLastPts = lastPts;
-							curLastFrameTime = lastFrameTime;
-						}
-
-						if (curLastPts > 0 && framePts > curLastPts)
-						{
-							long long frameDiff = framePts - curLastPts;
-							if (frameDiff > 0 && frameDiff < 500)
-							{
-								auto now = steady_clock::now();
-								auto elapsed = duration_cast<milliseconds>(now - curLastFrameTime);
-								long long frameWaitMs = curSpeed > 0 ? (long long)(frameDiff / curSpeed) : frameDiff;
-								long long waitMs = frameWaitMs - elapsed.count();
-								if (waitMs > 0 && waitMs < 500)
-								{
-									msleep((unsigned long)waitMs);
-								}
-							}
-						}
+						waitForFrame(framePts, curSpeed);
 					}
 				}
 				else
 				{
-					long long curLastPts;
-					steady_clock::time_point curLastFrameTime;
-					{
-						std::lock_guard<std::mutex> lk(vmux);
-						curLastPts = lastPts;
-						curLastFrameTime = lastFrameTime;
-					}
-
-					if (curLastPts > 0 && framePts > curLastPts)
-					{
-						long long frameDiff = framePts - curLastPts;
-						if (frameDiff > 0 && frameDiff < 500)
-						{
-							auto now = steady_clock::now();
-							auto elapsed = duration_cast<milliseconds>(now - curLastFrameTime);
-							long long frameWaitMs = curSpeed > 0 ? (long long)(frameDiff / curSpeed) : frameDiff;
-							long long waitMs = frameWaitMs - elapsed.count();
-							if (waitMs > 0 && waitMs < 500)
-							{
-								msleep((unsigned long)waitMs);
-							}
-						}
-					}
+					waitForFrame(framePts, curSpeed);
 				}
 			}
 
@@ -174,19 +143,68 @@ void VideoThread::run()
 				firstFrame = false;
 			}
 
-			if (call) call->Repaint(frame);
-			else av_frame_free(&frame);
+			if (repaintFuture_.valid()) repaintFuture_.get();
+			{
+				std::lock_guard<std::mutex> lk(vmux);
+				if (call)
+				{
+					auto& pool = GlobalThreadPool::Instance();
+					IVideoCallback *cb = call;
+					repaintFuture_ = pool.submitTask([cb, frame]() { cb->Repaint(frame); });
+				}
+				else
+				{
+					av_frame_free(&frame);
+				}
+			}
 		}
 
 		msleep(1);
 	}
+
+	if (repaintFuture_.valid()) repaintFuture_.get();
 }
 
-bool VideoThread::RepaintPts(AVPacket *pkt)
+void VideoThread::waitForFrame(long long framePts, double curSpeed)
+{
+	using namespace std::chrono;
+
+	long long curLastPts;
+	steady_clock::time_point curLastFrameTime;
+	{
+		std::lock_guard<std::mutex> lk(vmux);
+		curLastPts = lastPts;
+		curLastFrameTime = lastFrameTime;
+	}
+
+	if (curLastPts > 0 && framePts > curLastPts)
+	{
+		long long frameDiff = framePts - curLastPts;
+		if (frameDiff > 0 && frameDiff < 500)
+		{
+			auto now = steady_clock::now();
+			auto elapsed = duration_cast<milliseconds>(now - curLastFrameTime);
+			long long frameWaitMs = curSpeed > 0 ? (long long)(frameDiff / curSpeed) : frameDiff;
+			long long waitMs = frameWaitMs - elapsed.count();
+			if (waitMs > 0 && waitMs < 500)
+			{
+				msleep((unsigned long)waitMs);
+			}
+		}
+	}
+}
+
+bool VideoThread::RepaintPts(AVPacket *pkt, long long *outPts)
 {
 	std::lock_guard<std::mutex> lk(mux);
-	if (!decode || !decode->Send(pkt))
+	if (!decode)
 	{
+		RecyclePacket(pkt);
+		return false;
+	}
+	if (!decode->Send(pkt))
+	{
+		RecyclePacket(pkt);
 		return false;
 	}
 
@@ -195,6 +213,12 @@ bool VideoThread::RepaintPts(AVPacket *pkt)
 		AVFrame *frame = decode->Recv();
 		if (frame)
 		{
+			if (outPts)
+			{
+				long long framePts = frame->pts;
+				if (framePts <= 0) framePts = decode->getPts();
+				*outPts = framePts;
+			}
 			if (call) call->Repaint(frame);
 			else av_frame_free(&frame);
 			return true;

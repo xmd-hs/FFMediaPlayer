@@ -15,11 +15,14 @@ HEADERS += ../UI/ivideocallback.h \
     ../UI/seekslider.h \
     ../UI/videowidget.h \
     ../../ThreadPool/threadpool.h \
+    ../../ThreadPool/GlobalThreadPool.h \
     ../../MemoryPool/MemoryPool.h \
     ../../MemoryPool/Common.h \
     ../../MemoryPool/CentralCache.h \
     ../../MemoryPool/PageCache.h \
-    ../../MemoryPool/ThreadCache.h
+    ../../MemoryPool/ThreadCache.h \
+    ../../LockFree/LockFreeQueue.hpp \
+    ../../LockFree/LockFreeStack.hpp
 SOURCES += ../Config/main.cpp \
     ../Core/audioplayer.cpp \
     ../Thread/audiothread.cpp \

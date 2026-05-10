@@ -10,7 +10,9 @@ extern "C" {
 }
 using namespace std;
 
-AudioThread::AudioThread() {}
+AudioThread::AudioThread()
+{
+}
 
 AudioThread::~AudioThread() { Close(); }
 
@@ -60,7 +62,8 @@ bool AudioThread::Open(AVCodecParameters *para, int sampleRate, int channels)
 	}
 
 	ap->sampleRate = sampleRate;
-	ap->channels = channels;
+	ap->channels = 2;
+	ap->sampleSize = 16;
 	if (!ap->Open())
 	{
 		cout << "[Audio] audio output open failed!" << endl;
@@ -92,11 +95,19 @@ void AudioThread::SetSpeed(double s)
 {
 	if (s <= 0 || s > 8.0) return;
 	std::lock_guard<std::mutex> lk(amux);
+	if (firstFrame)
+	{
+		speed = s;
+		if (res) res->SetSpeed(s);
+		if (ap) ap->SetSpeed(s);
+		return;
+	}
 	long long playedMs = 0;
 	if (ap) playedMs = ap->GetPlayedMs();
 	double oldSpeed = speed.load();
 	long long hwDelta = playedMs - baseHwTime;
-	baseMediaTime += (long long)(hwDelta * oldSpeed);
+	if (hwDelta > 0)
+		baseMediaTime += (long long)(hwDelta * oldSpeed);
 	baseHwTime = playedMs;
 	speed = s;
 	if (res) res->SetSpeed(s);
@@ -129,9 +140,13 @@ void AudioThread::ResetClock(long long seekPts)
 
 void AudioThread::run()
 {
-	const size_t PCM_BUFFER_SIZE = 1024 * 1024;
+	const size_t PCM_BUFFER_SIZE = 256 * 1024; // MemoryPool MAX_BYTES
 	unsigned char *pcm = (unsigned char*)Kama_memoryPool::MemoryPool::allocate(PCM_BUFFER_SIZE);
-	if (!pcm) return;
+	if (!pcm)
+	{
+		std::cerr << "[Audio] PCM buffer allocation failed!" << std::endl;
+		return;
+	}
 
 	while (!isExit)
 	{
@@ -140,21 +155,23 @@ void AudioThread::run()
 		AVPacket *pkt = Pop();
 		if (!pkt) { msleep(1); continue; }
 
-		amux.lock();
-		bool hasRes = (res != nullptr);
-		bool hasAp = (ap != nullptr);
-		amux.unlock();
+		bool hasRes, hasAp;
+		{
+			std::lock_guard<std::mutex> lk(amux);
+			hasRes = (res != nullptr);
+			hasAp = (ap != nullptr);
+		}
 
 		if (!hasRes || !hasAp)
 		{
-			av_packet_free(&pkt);
+			RecyclePacket(pkt);
 			msleep(1);
 			continue;
 		}
 
 		if (!decode->Send(pkt))
 		{
-			msleep(1);
+			RecyclePacket(pkt);
 			continue;
 		}
 
@@ -172,6 +189,9 @@ void AudioThread::run()
 					audioStartPts = frame->pts;
 				}
 				if (ap) baseHwTime = ap->GetPlayedMs();
+				double curSpeed = speed.load();
+				if (res) res->SetSpeed(curSpeed);
+				if (ap) ap->SetSpeed(curSpeed);
 				firstFrame = false;
 			}
 			pts = frame->pts;
@@ -179,7 +199,7 @@ void AudioThread::run()
 			int len = 0;
 			amux.lock();
 			if (res && ap) len = res->Resample(frame, pcm, (int)PCM_BUFFER_SIZE);
-			else av_frame_free(&frame);
+			else { av_frame_free(&frame); amux.unlock(); continue; }
 			amux.unlock();
 
 			if (len > 0)
@@ -193,13 +213,8 @@ void AudioThread::run()
 					msleep(2);
 				}
 				amux.lock();
-				bool writeOk = false;
-				if (ap) writeOk = ap->Write(pcm, len);
+				if (ap) ap->Write(pcm, len);
 				amux.unlock();
-				if (!writeOk)
-				{
-					cout << "[Audio] Write failed, len=" << len << endl;
-				}
 			}
 		}
 		msleep(1);

@@ -1,5 +1,6 @@
 #pragma once
 #include <mutex>
+#include <functional>
 struct AVFormatContext;
 struct AVPacket;
 struct AVCodecParameters;
@@ -26,9 +27,12 @@ public:
 	int sampleRate = 0;
 	int channels = 0;
 
+	void SetPacketAllocator(std::function<AVPacket*()> alloc);
+
 protected:
 	std::mutex mux;
 	AVFormatContext *ic = nullptr;
 	int videoStream = -1;
 	int audioStream = -1;
+	std::function<AVPacket*()> packetAlloc_;
 };

@@ -1,26 +1,3 @@
-/**
- * @file videowidget.h
- * @brief OpenGL 视频渲染组件
- *
- * 基于 QOpenGLWidget 实现视频帧的 YUV→RGB 硬件加速渲染。
- * 接收解码后的 AVFrame，将 YUV 数据上传到 OpenGL 纹理，
- * 通过 Fragment Shader 实现 YUV 到 RGB 的颜色空间转换。
- *
- * 渲染流程：
- * 1. Repaint() 接收 AVFrame，复制 YUV 数据到内部缓冲区
- * 2. 触发 update() 请求重绘
- * 3. paintGL() 将 YUV 数据上传到三个纹理（Y/U/V）
- * 4. Fragment Shader 执行 YUV→RGB 转换并渲染
- *
- * 防闪烁设计：
- * - 设置 WA_OpaquePaintEvent 阻止 Qt 自动擦除背景
- * - 设置 AutoFillBackground 为 false 避免双清除
- * - 视频播放中始终渲染最后一帧，不切换到默认界面
- *
- * @author FFMediaPlayer Team
- * @version 1.2
- */
-
 #pragma once
 
 #include <QOpenGLWidget>
@@ -29,6 +6,7 @@
 #include <QMutex>
 #include "ivideocallback.h"
 #include "MemoryPool.h"
+#include "GlobalThreadPool.h"
 
 /**
  * @brief OpenGL 视频渲染组件类

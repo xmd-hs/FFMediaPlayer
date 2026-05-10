@@ -2,6 +2,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
+#include <set>
 
 #ifdef _WIN32
 #else
@@ -21,21 +22,19 @@ void* PageCache::allocateSpan(size_t numPages)
         Span* span = it->second;
 
         if (span->next)
-        {
             freeSpans_[it->first] = span->next;
-        }
         else
-        {
             freeSpans_.erase(it);
-        }
 
-        if (span->numPages > numPages) 
+        if (span->numPages > numPages)
         {
             Span* newSpan = new Span;
-            newSpan->pageAddr = static_cast<char*>(span->pageAddr) + 
+            newSpan->pageAddr = static_cast<char*>(span->pageAddr) +
                                 numPages * PAGE_SIZE;
             newSpan->numPages = span->numPages - numPages;
             newSpan->next = nullptr;
+
+            spanMap_[newSpan->pageAddr] = newSpan;
 
             auto& list = freeSpans_[newSpan->numPages];
             newSpan->next = list;
@@ -68,48 +67,41 @@ void PageCache::deallocateSpan(void* ptr, size_t numPages)
     if (it == spanMap_.end()) return;
 
     Span* span = it->second;
+    spanMap_.erase(it);
 
-    void* nextAddr = static_cast<char*>(ptr) + numPages * PAGE_SIZE;
+    void* nextAddr = static_cast<char*>(ptr) + span->numPages * PAGE_SIZE;
     auto nextIt = spanMap_.find(nextAddr);
-    
+
     if (nextIt != spanMap_.end())
     {
         Span* nextSpan = nextIt->second;
-        
-        bool found = false;
+        spanMap_.erase(nextIt);
+
         auto& nextList = freeSpans_[nextSpan->numPages];
-        
         if (nextList == nextSpan)
-        {
             nextList = nextSpan->next;
-            found = true;
-        }
         else if (nextList)
         {
             Span* prev = nextList;
             while (prev->next)
             {
                 if (prev->next == nextSpan)
-                {   
+                {
                     prev->next = nextSpan->next;
-                    found = true;
                     break;
                 }
                 prev = prev->next;
             }
         }
 
-        if (found)
-        {
-            span->numPages += nextSpan->numPages;
-            spanMap_.erase(nextAddr);
-            delete nextSpan;
-        }
+        span->numPages += nextSpan->numPages;
+        delete nextSpan;
     }
 
     auto& list = freeSpans_[span->numPages];
     span->next = list;
     list = span;
+    spanMap_[span->pageAddr] = span;
 }
 
 void* PageCache::systemAlloc(size_t numPages)
@@ -154,14 +146,14 @@ void PageCache::systemFree(void* ptr, size_t numPages)
 
 PageCache::~PageCache()
 {
+    std::set<Span*> freed;
     for (auto& pair : spanMap_)
     {
         Span* span = pair.second;
         if (span->pageAddr)
-        {
             systemFree(span->pageAddr, span->numPages);
-        }
         delete span;
+        freed.insert(span);
     }
     spanMap_.clear();
 
@@ -171,11 +163,12 @@ PageCache::~PageCache()
         while (span)
         {
             Span* next = span->next;
-            delete span;
+            if (freed.find(span) == freed.end())
+                delete span;
             span = next;
         }
     }
     freeSpans_.clear();
 }
 
-} // namespace memoryPool
+} // namespace Kama_memoryPool

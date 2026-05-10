@@ -5,6 +5,7 @@ extern "C" {
 }
 #include <QPainter>
 #include <QFont>
+#include <QThread>
 
 #define A_VER 3
 #define T_VER 4
@@ -138,7 +139,16 @@ void VideoWidget::Repaint(AVFrame *frame)
         int newH = frame->height;
         if (newW <= 0 || newH <= 0) { av_frame_free(&frame); return; }
         locker.unlock();
-        Init(newW, newH);
+        if (QThread::currentThread() == this->thread())
+        {
+            Init(newW, newH);
+        }
+        else
+        {
+            QMetaObject::invokeMethod(this, [this, newW, newH]() {
+                Init(newW, newH);
+            }, Qt::BlockingQueuedConnection);
+        }
         locker.relock();
         if (!hasVideo_ || !datas[0]) { av_frame_free(&frame); return; }
     }
@@ -150,20 +160,59 @@ void VideoWidget::Repaint(AVFrame *frame)
     }
 
     if (width == frame->linesize[0])
-    {
-        memcpy(datas[0], frame->data[0], width * height);
-        memcpy(datas[1], frame->data[1], width * height / 4);
-        memcpy(datas[2], frame->data[2], width * height / 4);
-    }
-    else
-    {
-        for (int i = 0; i < height; i++)
-            memcpy(datas[0] + width * i, frame->data[0] + frame->linesize[0] * i, width);
-        for (int i = 0; i < height / 2; i++)
-            memcpy(datas[1] + width / 2 * i, frame->data[1] + frame->linesize[1] * i, width / 2);
-        for (int i = 0; i < height / 2; i++)
-            memcpy(datas[2] + width / 2 * i, frame->data[2] + frame->linesize[2] * i, width / 2);
-    }
+	{
+		int szY = width * height;
+		int szUV = width * height / 4;
+		auto& pool = GlobalThreadPool::Instance();
+		unsigned char* dstY = datas[0];
+		unsigned char* dstU = datas[1];
+		unsigned char* dstV = datas[2];
+		const unsigned char* srcY = frame->data[0];
+		const unsigned char* srcU = frame->data[1];
+		const unsigned char* srcV = frame->data[2];
+		auto f1 = pool.submitTask([dstY, srcY, szY]() {
+			memcpy(dstY, srcY, szY);
+		});
+		auto f2 = pool.submitTask([dstU, srcU, szUV]() {
+			memcpy(dstU, srcU, szUV);
+		});
+		auto f3 = pool.submitTask([dstV, srcV, szUV]() {
+			memcpy(dstV, srcV, szUV);
+		});
+		f1.get();
+		f2.get();
+		f3.get();
+	}
+	else
+	{
+		int w = width;
+		int h = height;
+		int ls0 = frame->linesize[0];
+		int ls1 = frame->linesize[1];
+		int ls2 = frame->linesize[2];
+		unsigned char* dstY = datas[0];
+		unsigned char* dstU = datas[1];
+		unsigned char* dstV = datas[2];
+		const unsigned char* srcY = frame->data[0];
+		const unsigned char* srcU = frame->data[1];
+		const unsigned char* srcV = frame->data[2];
+		auto& pool = GlobalThreadPool::Instance();
+		auto f1 = pool.submitTask([dstY, srcY, w, h, ls0]() {
+			for (int i = 0; i < h; i++)
+				memcpy(dstY + w * i, srcY + ls0 * i, w);
+		});
+		auto f2 = pool.submitTask([dstU, srcU, w, h, ls1]() {
+			for (int i = 0; i < h / 2; i++)
+				memcpy(dstU + w / 2 * i, srcU + ls1 * i, w / 2);
+		});
+		auto f3 = pool.submitTask([dstV, srcV, w, h, ls2]() {
+			for (int i = 0; i < h / 2; i++)
+				memcpy(dstV + w / 2 * i, srcV + ls2 * i, w / 2);
+		});
+		f1.get();
+		f2.get();
+		f3.get();
+	}
 
     av_frame_free(&frame);
     QMetaObject::invokeMethod(this, "update", Qt::QueuedConnection);

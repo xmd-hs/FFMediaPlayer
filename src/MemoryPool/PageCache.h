@@ -1,4 +1,5 @@
 #pragma once
+
 #include "Common.h"
 #include <map>
 #include <mutex>
@@ -40,4 +41,4 @@ private:
     std::mutex mutex_;
 };
 
-} // namespace memoryPool
+} // namespace Kama_memoryPool

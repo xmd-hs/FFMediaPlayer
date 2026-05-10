@@ -1,5 +1,7 @@
 #pragma once
 #include <mutex>
+#include <atomic>
+#include <functional>
 struct AVCodecParameters;
 struct AVPacket;
 struct AVFrame;
@@ -20,11 +22,14 @@ public:
 	MediaDecoder();
 	virtual ~MediaDecoder();
 
-	long long getPts() const { return pts; }
+	long long getPts() const { return pts.load(); }
 	AVRational getTimeBase() const;
+
+	void SetPacketRecycler(std::function<void(AVPacket*)> recycler);
 
 protected:
 	mutable std::mutex mux;
 	AVCodecContext *codec_ = nullptr;
-	long long pts = 0;
+	std::atomic<long long> pts = {0};
+	std::function<void(AVPacket*)> packetRecycler_;
 };

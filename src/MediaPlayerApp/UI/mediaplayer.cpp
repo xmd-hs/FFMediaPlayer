@@ -51,8 +51,8 @@ MediaPlayer::MediaPlayer(QWidget *parent) : QWidget(parent)
 
 	// 进度条
 	playPos = new SeekSlider(this);
-	playPos->setRange(0, 999);
-	playPos->setPageStep(1);
+	playPos->setRange(0, 9999);  // 提高精度到万分之一
+	playPos->setPageStep(10);
 	playPos->setOrientation(Qt::Horizontal);
 	playPos->setStyleSheet(
 		"QSlider::groove:horizontal{height:4px;background:rgba(255,255,255,60);border-radius:2px}"
@@ -165,7 +165,14 @@ void MediaPlayer::SliderPress() { isSliderPress = true; }
 void MediaPlayer::SliderRelease()
 {
 	isSliderPress = false;
+	isSeeking = true;
 	double pos = (double)playPos->value() / (double)playPos->maximum();
+	seekTargetPos = pos;
+	seekStartTime = QDateTime::currentMSecsSinceEpoch();
+
+	// 立即更新进度条到目标位置，避免回退闪烁
+	playPos->setValue((int)(playPos->maximum() * pos));
+
 	dt.Seek(pos);
 }
 
@@ -183,16 +190,28 @@ void MediaPlayer::timerEvent(QTimerEvent *)
 		if (curPts < 0) curPts = 0;
 		double pos = (double)curPts / (double)total;
 		if (pos > 1.0) pos = 1.0;
-		playPos->setValue((int)(playPos->maximum() * pos));
 
-		int curSec = (int)(curPts / 1000);
-		int totSec = (int)(total / 1000);
-		QString timeText = QString("%1:%2 / %3:%4")
-			.arg(curSec / 60, 2, 10, QChar('0'))
-			.arg(curSec % 60, 2, 10, QChar('0'))
-			.arg(totSec / 60, 2, 10, QChar('0'))
-			.arg(totSec % 60, 2, 10, QChar('0'));
-		timeLabel->setText(timeText);
+		if (isSeeking)
+	{
+		// seeking 期间直接显示目标位置，避免回退
+		playPos->setValue((int)(playPos->maximum() * seekTargetPos));
+
+		long long now = QDateTime::currentMSecsSinceEpoch();
+		if (now - seekStartTime > 500)
+			isSeeking = false;
+		return; // 直接返回，不更新时间显示
+	}
+
+	playPos->setValue((int)(playPos->maximum() * pos));
+
+	int curSec = (int)((curPts + 500) / 1000);  // 四舍五入
+	int totSec = (int)((total + 500) / 1000);    // 四舍五入
+	QString timeText = QString("%1:%2 / %3:%4")
+		.arg(curSec / 60, 2, 10, QChar('0'))
+		.arg(curSec % 60, 2, 10, QChar('0'))
+		.arg(totSec / 60, 2, 10, QChar('0'))
+		.arg(totSec % 60, 2, 10, QChar('0'));
+	timeLabel->setText(timeText);
 	}
 }
 

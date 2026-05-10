@@ -1,73 +1,89 @@
 #include "decodethread.h"
 #include "mediadecoder.h"
+#include "LockFreeQueue.hpp"
+#include "LockFreeStack.hpp"
 extern "C" {
 #include <libavcodec/avcodec.h>
 }
 
 void DecodeThread::Close()
 {
-	Clear();
 	isExit = true;
+	Clear();
 	wait();
 	if (decode)
 	{
 		decode->Close();
-		{
-			std::lock_guard<std::mutex> lk(mux);
-			delete decode;
-			decode = NULL;
-		}
+		delete decode;
+		decode = nullptr;
 	}
+	AVPacket *pkt = nullptr;
+	while (freePackets_.pop(pkt))
+		av_packet_free(&pkt);
 }
 
 void DecodeThread::Clear()
 {
+	isClearing = true;
 	std::lock_guard<std::mutex> lk(mux);
 	if (decode) decode->Clear();
-	while (!packs.empty())
+	AVPacket *pkt = nullptr;
+	while (packs_.pop(pkt))
 	{
-		AVPacket *pkt = packs.front();
-		XFreePacket(&pkt);
-		packs.pop_front();
+		av_packet_unref(pkt);
+		freePackets_.push(pkt);
 	}
+	packs_.reset();
+	isClearing = false;
 }
 
 AVPacket *DecodeThread::Pop()
 {
-	std::lock_guard<std::mutex> lk(mux);
-	if (packs.empty()) return NULL;
-	AVPacket *pkt = packs.front();
-	packs.pop_front();
-	return pkt;
+	if (isClearing.load()) return nullptr;
+	AVPacket *pkt = nullptr;
+	if (packs_.pop(pkt))
+		return pkt;
+	return nullptr;
 }
 
 void DecodeThread::Push(AVPacket *pkt)
 {
 	if (!pkt) return;
-	while (!isExit)
+	while (!packs_.push(pkt))
 	{
-		{
-			std::lock_guard<std::mutex> lk(mux);
-			if (packs.size() < (size_t)maxList)
-			{
-				packs.push_back(pkt);
-				break;
-			}
-		}
-		msleep(1);
+		if (isExit) { RecyclePacket(pkt); return; }
+		std::this_thread::yield();
 	}
-	if (isExit) av_packet_free(&pkt);
+}
+
+AVPacket *DecodeThread::AllocPacket()
+{
+	AVPacket *pkt = nullptr;
+	if (freePackets_.pop(pkt))
+		return pkt;
+	return av_packet_alloc();
+}
+
+void DecodeThread::RecyclePacket(AVPacket *pkt)
+{
+	if (!pkt) return;
+	av_packet_unref(pkt);
+	freePackets_.push(pkt);
+}
+
+void DecodeThread::SetDecoderRecycler(std::function<void(AVPacket*)> recycler)
+{
+	if (decode) decode->SetPacketRecycler(std::move(recycler));
 }
 
 int DecodeThread::GetPackCount()
 {
-	std::lock_guard<std::mutex> lk(mux);
-	return (int)packs.size();
+	return (int)packs_.size();
 }
 
 DecodeThread::DecodeThread()
 {
-	if (!decode) decode = new MediaDecoder();
+	decode = new MediaDecoder();
 }
 
 DecodeThread::~DecodeThread()

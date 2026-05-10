@@ -1,4 +1,6 @@
 #include "audioresampler.h"
+#include "MemoryPool.h"
+#include "GlobalThreadPool.h"
 extern "C" {
 #include <libswresample/swresample.h>
 #include <libavcodec/avcodec.h>
@@ -6,9 +8,11 @@ extern "C" {
 #include <libavutil/opt.h>
 }
 #include <iostream>
+#include <vector>
 using namespace std;
 
 AudioResampler::AudioResampler() {}
+
 AudioResampler::~AudioResampler() { Close(); }
 
 void AudioResampler::Close()
@@ -18,8 +22,14 @@ void AudioResampler::Close()
 	if (inChLayout)
 	{
 		av_channel_layout_uninit(inChLayout);
-		delete inChLayout;
+		Kama_memoryPool::MemoryPool::deallocate(inChLayout, sizeof(AVChannelLayout));
 		inChLayout = nullptr;
+	}
+	if (tempBuf_ && tempBufSize_ > 0)
+	{
+		Kama_memoryPool::MemoryPool::deallocate(tempBuf_, tempBufSize_);
+		tempBuf_ = nullptr;
+		tempBufSize_ = 0;
 	}
 	mux.unlock();
 }
@@ -37,9 +47,9 @@ bool AudioResampler::Open(AVCodecParameters *para, bool isClearPara)
 	if (inChLayout)
 	{
 		av_channel_layout_uninit(inChLayout);
-		delete inChLayout;
+		Kama_memoryPool::MemoryPool::deallocate(inChLayout, sizeof(AVChannelLayout));
 	}
-	inChLayout = new AVChannelLayout();
+	inChLayout = (AVChannelLayout*)Kama_memoryPool::MemoryPool::allocate(sizeof(AVChannelLayout));
 	av_channel_layout_copy(inChLayout, &para->ch_layout);
 
 	if (actx) swr_free(&actx);
@@ -136,10 +146,25 @@ int AudioResampler::Resample(AVFrame *indata, unsigned char *d, int dataSize)
 
 	int bytesPerSample = av_get_bytes_per_sample(outFormat);
 	int sampleSize = 2 * bytesPerSample;
-	tempBuffer.resize(outSamples * sampleSize);
+	size_t needSize = outSamples * sampleSize;
+
+	if (needSize > tempBufSize_)
+	{
+		if (tempBuf_ && tempBufSize_ > 0)
+			Kama_memoryPool::MemoryPool::deallocate(tempBuf_, tempBufSize_);
+		tempBufSize_ = needSize;
+		tempBuf_ = (unsigned char*)Kama_memoryPool::MemoryPool::allocate(tempBufSize_);
+		if (!tempBuf_)
+		{
+			tempBufSize_ = 0;
+			mux.unlock();
+			av_frame_free(&indata);
+			return 0;
+		}
+	}
 
 	uint8_t *data[2] = { 0 };
-	data[0] = tempBuffer.data();
+	data[0] = tempBuf_;
 	int re = swr_convert(actx, data, outSamples,
 		(const uint8_t**)indata->data, indata->nb_samples);
 	mux.unlock();
@@ -157,26 +182,47 @@ int AudioResampler::Resample(AVFrame *indata, unsigned char *d, int dataSize)
 		int maxSamples = dataSize / sampleSize;
 		if (finalSamples > maxSamples) finalSamples = maxSamples;
 
-		double step = curSpeed;
-		double pos = 0.0;
-		int dstPos = 0;
+		int maxValidDst = (int)((double)re / curSpeed) - 1;
+		if (maxValidDst < 0) maxValidDst = 0;
+		if (finalSamples > maxValidDst + 1) finalSamples = maxValidDst + 1;
 
-		while (pos < re && dstPos < finalSamples) {
-			int srcIndex = (int)pos;
-			if (srcIndex >= re) break;
-
-			memcpy(d + dstPos * sampleSize,
-			       tempBuffer.data() + srcIndex * sampleSize,
-			       sampleSize);
-
-			dstPos++;
-			pos += step;
+		if (finalSamples > 512) {
+			auto& pool = GlobalThreadPool::Instance();
+			int numChunks = std::min((int)std::thread::hardware_concurrency(), (finalSamples + 255) / 256);
+			if (numChunks < 2) numChunks = 2;
+			int chunkSize = (finalSamples + numChunks - 1) / numChunks;
+			double speed = curSpeed;
+			unsigned char* srcBuf = tempBuf_;
+			std::vector<std::future<void>> futures;
+			for (int c = 0; c < numChunks; c++) {
+				int startIdx = c * chunkSize;
+				int endIdx = std::min(startIdx + chunkSize, finalSamples);
+				futures.push_back(pool.submitTask([d, srcBuf, re, sampleSize, speed, startIdx, endIdx]() {
+					for (int dstPos = startIdx; dstPos < endIdx; dstPos++) {
+						int srcIndex = (int)(dstPos * speed);
+						if (srcIndex >= re) break;
+						memcpy(d + dstPos * sampleSize, srcBuf + srcIndex * sampleSize, sampleSize);
+					}
+				}));
+			}
+			for (auto& f : futures) f.get();
+		} else {
+			double step = curSpeed;
+			double pos = 0.0;
+			int dstPos = 0;
+			while (pos < re && dstPos < finalSamples) {
+				int srcIndex = (int)pos;
+				if (srcIndex >= re) break;
+				memcpy(d + dstPos * sampleSize, tempBuf_ + srcIndex * sampleSize, sampleSize);
+				dstPos++;
+				pos += step;
+			}
+			finalSamples = dstPos;
 		}
-		finalSamples = dstPos;
 	} else {
 		int copyBytes = re * sampleSize;
 		if (copyBytes > dataSize) copyBytes = dataSize;
-		memcpy(d, tempBuffer.data(), copyBytes);
+		memcpy(d, tempBuf_, copyBytes);
 	}
 
 	av_frame_free(&indata);

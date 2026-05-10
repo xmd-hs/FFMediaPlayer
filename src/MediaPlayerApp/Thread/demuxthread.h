@@ -3,7 +3,9 @@
 #include <QThread>
 #include "ivideocallback.h"
 #include <mutex>
+#include <condition_variable>
 #include <atomic>
+#include "GlobalThreadPool.h"
 
 struct AVPacket;
 class MediaDemuxer;
@@ -29,6 +31,7 @@ public:
 	std::atomic_bool isPause = {false};
 	void SetVolume(int volume);
 	int GetVolume();
+	int volume_ = 80;
 	void SetSpeed(double speed);
 	double GetSpeed();
 	long long GetCurrentPts();
@@ -40,5 +43,7 @@ protected:
 	AudioThread *at = nullptr;
 	std::atomic<double> speed_ = {1.0};
 	std::atomic<double> seekPos_ = {-1.0};
+	std::condition_variable pauseCv_;
+	std::mutex pauseMux_;
 	void doSeek(double pos);
 };

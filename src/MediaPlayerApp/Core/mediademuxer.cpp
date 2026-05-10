@@ -1,5 +1,6 @@
 #include "mediademuxer.h"
 #include <iostream>
+#include "MemoryPool.h"
 using namespace std;
 extern "C" {
 #include <libavformat/avformat.h>
@@ -81,9 +82,10 @@ bool MediaDemuxer::Seek(double pos)
 	std::lock_guard<std::mutex> lk(mux);
 	if (!ic) return false;
 	long long seekPos = 0;
-	if (videoStream >= 0)
-		seekPos = ic->streams[videoStream]->duration * pos;
-	int re = av_seek_frame(ic, videoStream, seekPos, AVSEEK_FLAG_BACKWARD | AVSEEK_FLAG_FRAME);
+	int seekStream = videoStream >= 0 ? videoStream : audioStream;
+	if (seekStream >= 0)
+		seekPos = ic->streams[seekStream]->duration * pos;
+	int re = av_seek_frame(ic, seekStream, seekPos, AVSEEK_FLAG_BACKWARD | AVSEEK_FLAG_FRAME);
 	return re >= 0;
 }
 
@@ -113,24 +115,42 @@ bool MediaDemuxer::IsAudio(AVPacket *pkt)
 	return pkt->stream_index == audioStream;
 }
 
+void MediaDemuxer::SetPacketAllocator(std::function<AVPacket*()> alloc)
+{
+	packetAlloc_ = std::move(alloc);
+}
+
 AVPacket *MediaDemuxer::ReadVideo()
 {
-	AVPacket *pkt = nullptr;
-	for (int i = 0; i < 20; i++)
+	std::lock_guard<std::mutex> lk(mux);
+	if (!ic || videoStream < 0) return nullptr;
+	AVPacket tempPkt = {};
+	for (int i = 0; i < 200; i++)
 	{
-		pkt = Read();
-		if (!pkt) break;
-		if (pkt->stream_index == videoStream) break;
-		av_packet_free(&pkt);
+		av_packet_unref(&tempPkt);
+		int re = av_read_frame(ic, &tempPkt);
+		if (re != 0) break;
+		if (tempPkt.stream_index == videoStream)
+		{
+			AVPacket *out = packetAlloc_ ? packetAlloc_() : av_packet_alloc();
+			if (!out) out = av_packet_alloc();
+			av_packet_move_ref(out, &tempPkt);
+			AVRational tb = ic->streams[out->stream_index]->time_base;
+			out->pts = (out->pts != AV_NOPTS_VALUE) ? (long long)(out->pts * 1000 * r2d(tb)) : 0;
+			out->dts = (out->dts != AV_NOPTS_VALUE) ? (long long)(out->dts * 1000 * r2d(tb)) : 0;
+			return out;
+		}
 	}
-	return pkt;
+	av_packet_unref(&tempPkt);
+	return nullptr;
 }
 
 AVPacket *MediaDemuxer::Read()
 {
 	std::lock_guard<std::mutex> lk(mux);
 	if (!ic) return nullptr;
-	AVPacket *pkt = av_packet_alloc();
+	AVPacket *pkt = packetAlloc_ ? packetAlloc_() : av_packet_alloc();
+	if (!pkt) pkt = av_packet_alloc();
 	int re = av_read_frame(ic, pkt);
 	if (re != 0)
 	{

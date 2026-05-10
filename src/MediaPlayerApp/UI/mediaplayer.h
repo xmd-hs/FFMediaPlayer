@@ -33,6 +33,9 @@ private:
 	void SetPause(bool isPause);
 
 	bool isSliderPress = false;
+	bool isSeeking = false;
+	double seekTargetPos = 0.0;
+	long long seekStartTime = 0;
 	VideoWidget *videoWidget = nullptr;
 	SeekSlider *playPos = nullptr;
 	QPushButton *openFileBtn = nullptr;

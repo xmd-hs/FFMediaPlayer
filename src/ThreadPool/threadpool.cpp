@@ -1,17 +1,3 @@
-/**
- * @file threadpool.cpp
- * @brief 高性能动态线程池实现
- *
- * 实现 ThreadPool 类的核心逻辑，包括：
- * - Fixed 模式：固定线程数，持续等待任务
- * - Cached 模式：动态线程数，空闲超时回收，负载扩容
- * - Future/Promise 任务提交与结果获取
- * - 优雅关闭与资源回收
- *
- * @author FFMediaPlayer Team
- * @version 2.0
- */
-
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -22,7 +8,7 @@
 #include <chrono>
 #include "threadpool.h"
 
-int ThreadPool::Thread::generateId_ = 0;
+std::atomic_int ThreadPool::Thread::generateId_{0};
 
 ThreadPool::ThreadPool()
     : initThreadSize_(0)
@@ -54,26 +40,21 @@ void ThreadPool::stop()
 
 void ThreadPool::setMode(PoolMode mode)
 {
-    if (checkRunningState())
-        return;
+    if (checkRunningState()) return;
     poolMode_ = mode;
 }
 
 void ThreadPool::setTaskQueMaxThreshHold(int threshhold)
 {
-    if (checkRunningState())
-        return;
+    if (checkRunningState()) return;
     taskQueMaxThreshHold_ = threshhold;
 }
 
 void ThreadPool::setThreadSizeThreshHold(int threshhold)
 {
-    if (checkRunningState())
-        return;
+    if (checkRunningState()) return;
     if (poolMode_ == PoolMode::MODE_CACHED)
-    {
         threadSizeThreshHold_ = threshhold;
-    }
 }
 
 bool ThreadPool::submitTaskHelper(Task task)
@@ -149,7 +130,7 @@ void ThreadPool::threadFunc(int threadid)
                     if (std::cv_status::timeout ==
                         notEmpty_.wait_for(lock, std::chrono::seconds(1)))
                     {
-                        auto now = std::chrono::high_resolution_clock().now();
+                        auto now = std::chrono::high_resolution_clock::now();
                         auto dur = std::chrono::duration_cast<std::chrono::seconds>(now - lastTime);
                         if (dur.count() >= THREAD_MAX_IDLE_TIME
                             && curThreadSize_ > initThreadSize_)
@@ -181,20 +162,16 @@ void ThreadPool::threadFunc(int threadid)
             taskSize_--;
 
             if (taskQue_.size() > 0)
-            {
                 notEmpty_.notify_all();
-            }
 
             notFull_.notify_all();
         }
 
         if (task)
-        {
             task();
-        }
 
         idleThreadSize_++;
-        lastTime = std::chrono::high_resolution_clock().now();
+        lastTime = std::chrono::high_resolution_clock::now();
     }
 }
 
