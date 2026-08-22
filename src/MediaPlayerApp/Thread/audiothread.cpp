@@ -171,7 +171,6 @@ void AudioThread::run()
 
 		if (!decode->Send(pkt))
 		{
-			RecyclePacket(pkt);
 			continue;
 		}
 

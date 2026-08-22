@@ -2,6 +2,7 @@
 #include <cstring>
 extern "C" {
 #include <libavutil/frame.h>
+#include <libavutil/pixfmt.h>
 }
 #include <QPainter>
 #include <QFont>
@@ -130,6 +131,14 @@ void VideoWidget::Init(int width, int height)
 void VideoWidget::Repaint(AVFrame *frame)
 {
     if (!frame) return;
+
+    // The OpenGL path below is explicitly YUV420P. Do not upload other
+    // layouts as if they were planar 4:2:0; that causes corrupted output.
+    if (frame->format != AV_PIX_FMT_YUV420P)
+    {
+        av_frame_free(&frame);
+        return;
+    }
 
     QMutexLocker locker(&mux);
 

@@ -90,7 +90,11 @@ bool ThreadPool::submitTaskHelper(Task task)
 
 void ThreadPool::start(int initThreadSize)
 {
-    isPoolRunning_ = true;
+	if (isPoolRunning_)
+		return;
+	if (initThreadSize <= 0)
+		initThreadSize = 1;
+	isPoolRunning_ = true;
 
     initThreadSize_ = initThreadSize;
     curThreadSize_ = initThreadSize;

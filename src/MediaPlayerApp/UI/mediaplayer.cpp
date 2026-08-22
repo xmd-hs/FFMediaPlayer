@@ -181,6 +181,12 @@ void MediaPlayer::timerEvent(QTimerEvent *)
 {
 	if (hintLabel && hintLabel->isVisible())
 		hintLabel->setGeometry(videoWidget->rect());
+	if (dt.isEof)
+	{
+		isSeeking = false;
+		if (isplayBtn) isplayBtn->setText("播放");
+		return;
+	}
 	if (isSliderPress) return;
 	long long total = dt.totalMs;
 	if (total > 0)

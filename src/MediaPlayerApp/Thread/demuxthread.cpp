@@ -299,7 +299,14 @@ void DemuxThread::run()
 		}
 
 		AVPacket *pkt = curDemux->Read();
-		if (!pkt) { msleep(5); continue; }
+		if (!pkt)
+		{
+			isEof = true;
+			isPause = true;
+			if (curAt) curAt->SetPause(true);
+			if (curVt) curVt->SetPause(true);
+			continue;
+		}
 
 		if (seekPos_.load() >= 0.0)
 		{
@@ -348,6 +355,8 @@ bool DemuxThread::Open(const char *url, IVideoCallback *call)
 
 	mux.lock();
 	seekPos_ = -1.0;
+	isEof = false;
+	isPause = false;
 
 	demux = new MediaDemuxer();
 	if (!demux->Open(url))

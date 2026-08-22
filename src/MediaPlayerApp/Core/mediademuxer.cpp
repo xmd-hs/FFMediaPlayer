@@ -31,7 +31,19 @@ bool MediaDemuxer::Open(const char *url)
 	cout << "[Demuxer] opened: " << url << endl;
 
 	re = avformat_find_stream_info(ic, 0);
-	totalMs = ic->duration / (AV_TIME_BASE / 1000);
+	if (re < 0)
+	{
+		char buf[1024] = { 0 };
+		av_strerror(re, buf, sizeof(buf) - 1);
+		cout << "[Demuxer] stream info failed: " << buf << endl;
+		avformat_close_input(&ic);
+		av_dict_free(&opts);
+		return false;
+	}
+	// Live streams and some malformed containers report AV_NOPTS_VALUE.
+	// Never expose that sentinel as a positive UI duration.
+	totalMs = (ic->duration != AV_NOPTS_VALUE && ic->duration > 0)
+		? (int)(ic->duration / (AV_TIME_BASE / 1000)) : 0;
 	cout << "[Demuxer] duration: " << totalMs << " ms" << endl;
 	av_dump_format(ic, 0, url, 0);
 
@@ -54,6 +66,12 @@ bool MediaDemuxer::Open(const char *url)
 		AVStream *as = ic->streams[audioStream];
 		sampleRate = as->codecpar->sample_rate;
 		channels = as->codecpar->ch_layout.nb_channels;
+		if (sampleRate <= 0 || channels <= 0)
+		{
+			sampleRate = 0;
+			channels = 0;
+			cout << "[Demuxer] audio stream has invalid parameters" << endl;
+		}
 		cout << "[Demuxer] audio #" << audioStream
 			<< " " << sampleRate << "Hz " << channels << "ch"
 			<< " codec=" << as->codecpar->codec_id << endl;
@@ -72,21 +90,41 @@ void MediaDemuxer::Clear()
 void MediaDemuxer::Close()
 {
 	std::lock_guard<std::mutex> lk(mux);
-	if (!ic) return;
-	avformat_close_input(&ic);
+	if (ic) avformat_close_input(&ic);
 	totalMs = 0;
+	width = height = sampleRate = channels = 0;
+	videoStream = audioStream = -1;
 }
 
 bool MediaDemuxer::Seek(double pos)
 {
 	std::lock_guard<std::mutex> lk(mux);
 	if (!ic) return false;
-	long long seekPos = 0;
+	if (pos < 0.0) pos = 0.0;
+	if (pos > 1.0) pos = 1.0;
 	int seekStream = videoStream >= 0 ? videoStream : audioStream;
-	if (seekStream >= 0)
-		seekPos = ic->streams[seekStream]->duration * pos;
-	int re = av_seek_frame(ic, seekStream, seekPos, AVSEEK_FLAG_BACKWARD | AVSEEK_FLAG_FRAME);
-	return re >= 0;
+	if (seekStream < 0) return false;
+
+	const AVStream *stream = ic->streams[seekStream];
+	int64_t target = 0;
+	if (stream->duration != AV_NOPTS_VALUE && stream->duration >= 0)
+	{
+		// Seek positions are expressed in the selected stream's time base.
+		int64_t offset = stream->start_time == AV_NOPTS_VALUE ? 0 : stream->start_time;
+		target = offset + (int64_t)(stream->duration * pos);
+	}
+	else if (ic->duration != AV_NOPTS_VALUE && ic->duration >= 0)
+	{
+		// Fall back to the container time base when stream duration is unknown.
+		target = av_rescale_q((int64_t)(ic->duration * pos),
+			AV_TIME_BASE_Q, stream->time_base);
+	}
+	else
+	{
+		return false;
+	}
+	return av_seek_frame(ic, seekStream, target,
+		AVSEEK_FLAG_BACKWARD | AVSEEK_FLAG_FRAME) >= 0;
 }
 
 AVCodecParameters *MediaDemuxer::CopyVPara()
@@ -134,10 +172,15 @@ AVPacket *MediaDemuxer::ReadVideo()
 		{
 			AVPacket *out = packetAlloc_ ? packetAlloc_() : av_packet_alloc();
 			if (!out) out = av_packet_alloc();
+			if (!out)
+			{
+				av_packet_unref(&tempPkt);
+				return nullptr;
+			}
 			av_packet_move_ref(out, &tempPkt);
 			AVRational tb = ic->streams[out->stream_index]->time_base;
-			out->pts = (out->pts != AV_NOPTS_VALUE) ? (long long)(out->pts * 1000 * r2d(tb)) : 0;
-			out->dts = (out->dts != AV_NOPTS_VALUE) ? (long long)(out->dts * 1000 * r2d(tb)) : 0;
+			out->pts = (out->pts != AV_NOPTS_VALUE) ? av_rescale_q(out->pts, tb, AVRational{1, 1000}) : 0;
+			out->dts = (out->dts != AV_NOPTS_VALUE) ? av_rescale_q(out->dts, tb, AVRational{1, 1000}) : 0;
 			return out;
 		}
 	}
@@ -151,19 +194,25 @@ AVPacket *MediaDemuxer::Read()
 	if (!ic) return nullptr;
 	AVPacket *pkt = packetAlloc_ ? packetAlloc_() : av_packet_alloc();
 	if (!pkt) pkt = av_packet_alloc();
+	if (!pkt) return nullptr;
 	int re = av_read_frame(ic, pkt);
 	if (re != 0)
 	{
 		av_packet_free(&pkt);
 		return nullptr;
 	}
+	if (pkt->stream_index < 0 || pkt->stream_index >= (int)ic->nb_streams)
+	{
+		av_packet_free(&pkt);
+		return nullptr;
+	}
 	AVRational tb = ic->streams[pkt->stream_index]->time_base;
 	if (pkt->pts != AV_NOPTS_VALUE)
-		pkt->pts = pkt->pts * 1000 * r2d(tb);
+		pkt->pts = av_rescale_q(pkt->pts, tb, AVRational{1, 1000});
 	else
 		pkt->pts = 0;
 	if (pkt->dts != AV_NOPTS_VALUE)
-		pkt->dts = pkt->dts * 1000 * r2d(tb);
+		pkt->dts = av_rescale_q(pkt->dts, tb, AVRational{1, 1000});
 	else
 		pkt->dts = 0;
 	return pkt;

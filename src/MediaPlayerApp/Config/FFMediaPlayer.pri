@@ -21,6 +21,7 @@ HEADERS += ../UI/ivideocallback.h \
     ../../MemoryPool/CentralCache.h \
     ../../MemoryPool/PageCache.h \
     ../../MemoryPool/ThreadCache.h \
+    ../../MemoryPool/Platform.h \
     ../../LockFree/LockFreeQueue.hpp \
     ../../LockFree/LockFreeStack.hpp
 SOURCES += ../Config/main.cpp \
@@ -38,4 +39,5 @@ SOURCES += ../Config/main.cpp \
     ../../ThreadPool/threadpool.cpp \
     ../../MemoryPool/CentralCache.cpp \
     ../../MemoryPool/PageCache.cpp \
-    ../../MemoryPool/ThreadCache.cpp
+    ../../MemoryPool/ThreadCache.cpp \
+    ../../MemoryPool/MemoryPool.cpp

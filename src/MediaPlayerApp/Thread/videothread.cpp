@@ -4,8 +4,37 @@
 extern "C" {
 #include <libavutil/frame.h>
 #include <libavcodec/avcodec.h>
+#include <libswscale/swscale.h>
 }
 using namespace std;
+
+static AVFrame* ToYuv420P(AVFrame *src)
+{
+	if (!src) return nullptr;
+	if (src->format == AV_PIX_FMT_YUV420P) return src;
+	SwsContext *sws = sws_getContext(src->width, src->height,
+		(AVPixelFormat)src->format, src->width, src->height,
+		AV_PIX_FMT_YUV420P, SWS_BILINEAR, nullptr, nullptr, nullptr);
+	if (!sws) { av_frame_free(&src); return nullptr; }
+	AVFrame *dst = av_frame_alloc();
+	if (!dst) { sws_freeContext(sws); av_frame_free(&src); return nullptr; }
+	dst->format = AV_PIX_FMT_YUV420P;
+	dst->width = src->width;
+	dst->height = src->height;
+	if (av_frame_get_buffer(dst, 32) < 0 ||
+		sws_scale(sws, src->data, src->linesize, 0, src->height,
+			dst->data, dst->linesize) <= 0)
+	{
+		av_frame_free(&dst);
+		sws_freeContext(sws);
+		av_frame_free(&src);
+		return nullptr;
+	}
+	dst->pts = src->pts;
+	sws_freeContext(sws);
+	av_frame_free(&src);
+	return dst;
+}
 
 VideoThread::VideoThread() {}
 VideoThread::~VideoThread() { Close(); }
@@ -91,7 +120,6 @@ void VideoThread::run()
 			}
 			if (!decode->Send(pkt))
 			{
-				RecyclePacket(pkt);
 				continue;
 			}
 		}
@@ -106,6 +134,8 @@ void VideoThread::run()
 			}
 
 			if (!frame) break;
+			frame = ToYuv420P(frame);
+			if (!frame) continue;
 
 			long long framePts = frame->pts;
 			if (framePts <= 0)
@@ -204,7 +234,6 @@ bool VideoThread::RepaintPts(AVPacket *pkt, long long *outPts)
 	}
 	if (!decode->Send(pkt))
 	{
-		RecyclePacket(pkt);
 		return false;
 	}
 
@@ -213,6 +242,8 @@ bool VideoThread::RepaintPts(AVPacket *pkt, long long *outPts)
 		AVFrame *frame = decode->Recv();
 		if (frame)
 		{
+			frame = ToYuv420P(frame);
+			if (!frame) return false;
 			if (outPts)
 			{
 				long long framePts = frame->pts;

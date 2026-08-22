@@ -1,10 +1,18 @@
 #pragma once
-
 #include "Common.h"
-#include <mutex>
+#include "PageCache.h"
+
+#include <array>
+#include <atomic>
 
 namespace Kama_memoryPool
 {
+
+struct CacheShard
+{
+    alignas(64) std::atomic_flag lock;
+    Span* partial;
+};
 
 class CentralCache
 {
@@ -15,23 +23,18 @@ public:
         return instance;
     }
 
-    void* fetchRange(size_t index, size_t batchNum);
-    void returnRange(void* start, size_t numBlocks, size_t index);
+    void* fetchRange(size_t index, size_t batchNum, size_t& fetchedCount);
+    void returnRange(void* start, size_t blockCount, size_t index);
 
 private:
-    CentralCache()
-    {
-        for (auto& ptr : centralFreeList_)
-            ptr.store(nullptr, std::memory_order_relaxed);
-        for (auto& lock : locks_)
-            lock.clear();
-    }
+    CentralCache();
+    CentralCache(const CentralCache&) = delete;
+    CentralCache& operator=(const CentralCache&) = delete;
 
-    void* fetchFromPageCache(size_t size);
+    Span* createSpan(size_t index);
+    void unlinkPartial(size_t index, Span* span);
 
-private:
-    std::array<std::atomic<void*>, FREE_LIST_SIZE> centralFreeList_;
-    std::array<std::atomic_flag, FREE_LIST_SIZE> locks_;
+    std::array<CacheShard, FREE_LIST_SIZE> shards_{};
 };
 
 } // namespace Kama_memoryPool

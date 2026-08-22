@@ -24,48 +24,48 @@ DEPENDPATH += .
 win32 {
     CONFIG(debug, debug|release) {
         TARGET = FFMediaPlayer
-        DESTDIR = ../../../bin/win64/debug
-        OBJECTS_DIR = ../../../build/win64/debug/obj
-        MOC_DIR = ../../../build/win64/debug/moc
-        RCC_DIR = ../../../build/win64/debug/rcc
-        UI_DIR = ../../../build/win64/debug/ui
+        DESTDIR = $$PWD/../../../bin/win64/debug
+        OBJECTS_DIR = $$PWD/../../../build/win64/debug/obj
+        MOC_DIR = $$PWD/../../../build/win64/debug/moc
+        RCC_DIR = $$PWD/../../../build/win64/debug/rcc
+        UI_DIR = $$PWD/../../../build/win64/debug/ui
         DEFINES += _DEBUG
     }
     CONFIG(release, debug|release) {
-        DESTDIR = ../../../bin/win64/release
-        OBJECTS_DIR = ../../../build/win64/release/obj
-        MOC_DIR = ../../../build/win64/release/moc
-        RCC_DIR = ../../../build/win64/release/rcc
-        UI_DIR = ../../../build/win64/release/ui
+        DESTDIR = $$PWD/../../../bin/win64/release
+        OBJECTS_DIR = $$PWD/../../../build/win64/release/obj
+        MOC_DIR = $$PWD/../../../build/win64/release/moc
+        RCC_DIR = $$PWD/../../../build/win64/release/rcc
+        UI_DIR = $$PWD/../../../build/win64/release/ui
         DEFINES += NDEBUG
     }
-    LIBS += -L"./../../../lib/win64/release"
+    LIBS += -L"$$PWD/../../../lib/win64/release"
     RC_FILE += FFMediaPlayer.rc
 }
 
 unix {
     CONFIG(debug, debug|release) {
-        DESTDIR = ../../../bin/linux64/debug
-        OBJECTS_DIR = ../../../build/linux64/debug/obj
-        MOC_DIR = ../../../build/linux64/debug/moc
-        RCC_DIR = ../../../build/linux64/debug/rcc
-        UI_DIR = ../../../build/linux64/debug/ui
+        DESTDIR = $$PWD/../../../bin/linux64/debug
+        OBJECTS_DIR = $$PWD/../../../build/linux64/debug/obj
+        MOC_DIR = $$PWD/../../../build/linux64/debug/moc
+        RCC_DIR = $$PWD/../../../build/linux64/debug/rcc
+        UI_DIR = $$PWD/../../../build/linux64/debug/ui
         DEFINES += _DEBUG
     }
     CONFIG(release, debug|release) {
-        DESTDIR = ../../../bin/linux64/release
-        OBJECTS_DIR = ../../../build/linux64/release/obj
-        MOC_DIR = ../../../build/linux64/release/moc
-        RCC_DIR = ../../../build/linux64/release/rcc
-        UI_DIR = ../../../build/linux64/release/ui
+        DESTDIR = $$PWD/../../../bin/linux64/release
+        OBJECTS_DIR = $$PWD/../../../build/linux64/release/obj
+        MOC_DIR = $$PWD/../../../build/linux64/release/moc
+        RCC_DIR = $$PWD/../../../build/linux64/release/rcc
+        UI_DIR = $$PWD/../../../build/linux64/release/ui
         DEFINES += NDEBUG
     }
-    LIBS += -L"./../../../lib/linux64/release"
+    LIBS += -L"$$PWD/../../../lib/linux64/release"
     QMAKE_RPATHDIR += \$ORIGIN
     QMAKE_LFLAGS += -Wl,--no-as-needed
 }
 
-LIBS += -lavcodec -lavformat -lavutil -lswresample -lswscale -lavfilter -lavdevice -lpostproc
+LIBS += -lavcodec -lavformat -lavutil -lswresample -lswscale -lavfilter -lavdevice
 
 unix {
     LIBS += -latomic

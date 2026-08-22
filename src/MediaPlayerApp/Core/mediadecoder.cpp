@@ -47,8 +47,20 @@ bool MediaDecoder::Open(AVCodecParameters *para)
 
 	std::lock_guard<std::mutex> lk(mux);
 	codec_ = avcodec_alloc_context3(vcodec);
-	avcodec_parameters_to_context(codec_, para);
+	if (!codec_)
+	{
+		avcodec_parameters_free(&para);
+		cout << "[Decoder] context allocation failed" << endl;
+		return false;
+	}
+	int copyRe = avcodec_parameters_to_context(codec_, para);
 	avcodec_parameters_free(&para);
+	if (copyRe < 0)
+	{
+		avcodec_free_context(&codec_);
+		cout << "[Decoder] failed to copy codec parameters" << endl;
+		return false;
+	}
 	codec_->thread_count = (int)std::thread::hardware_concurrency();
 
 	int re = avcodec_open2(codec_, 0, 0);

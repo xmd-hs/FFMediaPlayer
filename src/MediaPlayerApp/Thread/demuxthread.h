@@ -29,6 +29,7 @@ public:
 	long long totalMs = 0;
 	void SetPause(bool isPause);
 	std::atomic_bool isPause = {false};
+	std::atomic_bool isEof = {false};
 	void SetVolume(int volume);
 	int GetVolume();
 	int volume_ = 80;
