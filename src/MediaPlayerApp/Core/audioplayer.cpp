@@ -61,22 +61,21 @@ public:
 			fmt = devInfo.nearestFormat(fmt);
 		}
 
-		mux.lock();
+		std::lock_guard<std::mutex> lk(mux);
 		output = new QAudioOutput(devInfo, fmt);
-		int bufSize = sampleRate * channels;
+		int bufSize = sampleRate * channels * (sampleSize / 8) / 2; // ~500ms
 		if (bufSize < 8192) bufSize = 8192;
 		output->setBufferSize(bufSize);
 		io = output->start();
 		playStartElapsed = output->elapsedUSecs() / 1000;
-		mux.unlock();
+		opened_ = (io != nullptr);
 
-		if (!io)
+		if (!opened_)
 		{
 			cout << "[Audio] ERROR: output->start() returned null!" << endl;
-			mux.lock();
 			delete output;
 			output = nullptr;
-			mux.unlock();
+			io = nullptr;
 			return false;
 		}
 
@@ -86,20 +85,24 @@ public:
 
 	void Close() override
 	{
-		mux.lock();
-		if (output)
+		QAudioOutput *old = nullptr;
 		{
-			output->stop();
-			QAudioOutput *old = output;
-			output = nullptr;
-			io = nullptr;
-			mux.unlock();
-			this_thread::sleep_for(chrono::milliseconds(50));
-			delete old;
+			std::lock_guard<std::mutex> lk(mux);
+			opened_ = false;
+			if (output)
+			{
+				output->stop();
+				old = output;
+				output = nullptr;
+				io = nullptr;
+				playStartElapsed = 0;
+			}
 		}
-		else
+		if (old)
 		{
-			mux.unlock();
+			// Let Qt finish stopping the device before delete.
+			this_thread::sleep_for(chrono::milliseconds(20));
+			delete old;
 		}
 	}
 
@@ -110,7 +113,8 @@ public:
 		{
 			output->reset();
 			io = output->start();
-			playStartElapsed = 0;
+			playStartElapsed = output ? (output->elapsedUSecs() / 1000) : 0;
+			opened_ = (io != nullptr);
 		}
 	}
 
@@ -118,7 +122,7 @@ public:
 	{
 		std::lock_guard<std::mutex> lk(mux);
 		long long playedMs = 0;
-		if (output && io && sampleRate > 0 && channels > 0)
+		if (opened_ && output && io && sampleRate > 0 && channels > 0)
 		{
 			long long processedMs = output->processedUSecs() / 1000;
 			playedMs = processedMs - playStartElapsed;
@@ -131,8 +135,8 @@ public:
 	bool Write(const unsigned char *data, int datasize) override
 	{
 		if (!data || datasize <= 0) return false;
-		mux.lock();
-		if (!output) { mux.unlock(); return false; }
+		std::lock_guard<std::mutex> lk(mux);
+		if (!opened_ || !output) return false;
 		if (!io) { io = output->start(); }
 		if (!io)
 		{
@@ -142,51 +146,43 @@ public:
 				cout << "[Audio] ERROR: Failed to start audio output (no audio device?)" << endl;
 				warned = true;
 			}
-			mux.unlock();
 			return false;
 		}
 		int written = io->write((const char *)data, datasize);
-		mux.unlock();
 		return written > 0;
 	}
 
 	int GetFree() override
 	{
-		mux.lock();
-		if (!output) { mux.unlock(); return 0; }
-		if (!io) { mux.unlock(); return output->bufferSize(); }
-		int f = output->bytesFree();
-		mux.unlock();
-		return f;
+		std::lock_guard<std::mutex> lk(mux);
+		if (!opened_ || !output) return 0;
+		if (!io) return output->bufferSize();
+		return output->bytesFree();
 	}
 
 	void SetPause(bool isPause) override
 	{
 		std::lock_guard<std::mutex> lk(mux);
-		if (output)
+		if (!opened_ || !output) return;
+		if (isPause) output->suspend();
+		else
 		{
-			if (isPause) output->suspend();
-			else
-			{
-				if (!io) io = output->start();
-				else output->resume();
-			}
+			if (!io) io = output->start();
+			else output->resume();
 		}
 	}
 
 	void SetVolume(int volume) override
 	{
-		mux.lock();
+		std::lock_guard<std::mutex> lk(mux);
 		if (output) output->setVolume(qreal(volume) / 100.0);
-		mux.unlock();
 	}
 
 	int GetVolume() override
 	{
-		mux.lock();
+		std::lock_guard<std::mutex> lk(mux);
 		int v = 0;
 		if (output) v = int(output->volume() * 100.0);
-		mux.unlock();
 		return v;
 	}
 
@@ -206,8 +202,14 @@ private:
 	QIODevice *io = nullptr;
 	std::mutex mux;
 	long long playStartElapsed = 0;
+	bool opened_ = false;
 };
 
 AudioPlayer::AudioPlayer() {}
 AudioPlayer::~AudioPlayer() {}
-AudioPlayer *AudioPlayer::Get() { static CAudioPlay p; return &p; }
+AudioPlayer *AudioPlayer::Get()
+{
+	// Process-wide singleton: one output device. Always Open()/Close() via AudioThread.
+	static CAudioPlay p;
+	return &p;
+}

@@ -2,6 +2,7 @@
 #include "mediademuxer.h"
 #include "videothread.h"
 #include "audiothread.h"
+#include "subtitlethread.h"
 #include "audioplayer.h"
 #include "GlobalThreadPool.h"
 #include <iostream>
@@ -11,13 +12,146 @@ extern "C" {
 }
 using namespace std;
 
-DemuxThread::DemuxThread()
+DemuxThread::DemuxThread() {}
+DemuxThread::~DemuxThread() { Close(); }
+
+void DemuxThread::SetOpenOptions(const DemuxOpenOptions &opts)
 {
+	std::lock_guard<std::mutex> lk(mux);
+	openOpts_ = opts;
 }
 
-DemuxThread::~DemuxThread()
+DemuxOpenOptions DemuxThread::GetOpenOptions() const
 {
-	Close();
+	// const cast for mutex - use mutable would be better; copy under lock via const_cast pattern
+	auto *self = const_cast<DemuxThread*>(this);
+	std::lock_guard<std::mutex> lk(self->mux);
+	return openOpts_;
+}
+
+std::string DemuxThread::LastError() const
+{
+	auto *self = const_cast<DemuxThread*>(this);
+	std::lock_guard<std::mutex> lk(self->mux);
+	return lastError_;
+}
+
+void DemuxThread::SetSubtitleCallback(ISubtitleCallback *cb)
+{
+	std::lock_guard<std::mutex> lk(mux);
+	subCallback_ = cb;
+	if (st) st->SetCallback(cb);
+}
+
+std::vector<SubtitleTrackInfo> DemuxThread::GetSubtitleTracks()
+{
+	std::lock_guard<std::mutex> lk(mux);
+	if (!demux) return {};
+	return demux->ListSubtitleTracks();
+}
+
+std::vector<AudioTrackInfo> DemuxThread::GetAudioTracks()
+{
+	std::lock_guard<std::mutex> lk(mux);
+	if (!demux) return {};
+	return demux->ListAudioTracks();
+}
+
+bool DemuxThread::openSubtitleLocked()
+{
+	if (st)
+	{
+		st->isExit = true;
+		st->Close();
+		delete st;
+		st = nullptr;
+	}
+	if (!demux || demux->CurrentSubtitleStream() < 0)
+		return false;
+
+	AVCodecParameters *spara = demux->CopySPara();
+	if (!spara) return false;
+
+	st = new SubtitleThread();
+	st->SetCallback(subCallback_);
+	if (!st->Open(spara))
+	{
+		delete st;
+		st = nullptr;
+		return false;
+	}
+	auto *capturedSt = st;
+	st->SetDecoderRecycler([capturedSt](AVPacket *p) { capturedSt->RecyclePacket(p); });
+	st->start();
+	return true;
+}
+
+bool DemuxThread::openAudioLocked()
+{
+	if (at)
+	{
+		at->isExit = true;
+		at->Close();
+		delete at;
+		at = nullptr;
+	}
+	if (!demux || demux->sampleRate <= 0 || demux->channels <= 0)
+		return false;
+
+	AVCodecParameters *apara = demux->CopyAPara();
+	if (!apara) return false;
+
+	at = new AudioThread();
+	if (!at->Open(apara, demux->sampleRate, demux->channels))
+	{
+		delete at;
+		at = nullptr;
+		return false;
+	}
+	auto *capturedAt = at;
+	at->SetDecoderRecycler([capturedAt](AVPacket *p) { capturedAt->RecyclePacket(p); });
+	if (at->ap) at->ap->SetVolume(volume_);
+	at->SetSpeed(speed_.load());
+	at->start();
+	return true;
+}
+
+bool DemuxThread::SetSubtitleTrack(int streamIndex)
+{
+	std::lock_guard<std::mutex> lk(mux);
+	if (!demux) return false;
+	if (!demux->SelectSubtitle(streamIndex))
+	{
+		lastError_ = demux->LastError();
+		return false;
+	}
+	if (streamIndex < 0)
+	{
+		if (st)
+		{
+			st->isExit = true;
+			st->Close();
+			delete st;
+			st = nullptr;
+		}
+		if (subCallback_) subCallback_->OnSubtitleClear();
+		return true;
+	}
+	return openSubtitleLocked();
+}
+
+bool DemuxThread::SetAudioTrack(int streamIndex)
+{
+	std::lock_guard<std::mutex> lk(mux);
+	if (!demux) return false;
+	if (!demux->SelectAudio(streamIndex))
+	{
+		lastError_ = demux->LastError();
+		return false;
+	}
+	bool ok = openAudioLocked();
+	if (!ok) lastError_ = "failed to open selected audio track";
+	return ok;
 }
 
 void DemuxThread::Clear()
@@ -25,19 +159,23 @@ void DemuxThread::Clear()
 	MediaDemuxer *curDemux = nullptr;
 	VideoThread *curVt = nullptr;
 	AudioThread *curAt = nullptr;
+	SubtitleThread *curSt = nullptr;
 	{
 		std::lock_guard<std::mutex> lk(mux);
 		curDemux = demux;
 		curVt = vt;
 		curAt = at;
+		curSt = st;
 	}
 	if (curDemux) curDemux->Clear();
 	if (curVt) curVt->Clear();
 	if (curAt) curAt->Clear();
+	if (curSt) curSt->Clear();
 }
 
 void DemuxThread::Seek(double pos)
 {
+	if (totalMs <= 0) return;
 	if (pos < 0.0) pos = 0.0;
 	if (pos > 1.0) pos = 1.0;
 	seekPos_ = pos;
@@ -48,9 +186,10 @@ void DemuxThread::doSeek(double pos)
 	MediaDemuxer *curDemux = nullptr;
 	VideoThread *curVt = nullptr;
 	AudioThread *curAt = nullptr;
+	SubtitleThread *curSt = nullptr;
 	{
 		std::lock_guard<std::mutex> lk(mux);
-		if (!demux || !vt)
+		if (!demux || (!vt && !at))
 		{
 			isPause = false;
 			return;
@@ -58,19 +197,24 @@ void DemuxThread::doSeek(double pos)
 		curDemux = demux;
 		curVt = vt;
 		curAt = at;
+		curSt = st;
 	}
 
+	isEof = false;
+	isBuffering = true;
 	bool wasPause = isPause.load();
 	double curSpeed = speed_.load();
 	isPause = true;
 	if (curAt) curAt->SetPause(true);
 	if (curVt) curVt->SetPause(true);
+	if (curSt) curSt->SetPause(true);
 
 	{
 		auto& pool = GlobalThreadPool::Instance();
 		auto f1 = pool.submitTask([](VideoThread *t) { if(t) t->Clear(); }, curVt);
 		auto f2 = pool.submitTask([](AudioThread *t) { if(t) t->Clear(); }, curAt);
-		f1.get(); f2.get();
+		auto f3 = pool.submitTask([](SubtitleThread *t) { if(t) t->Clear(); }, curSt);
+		f1.get(); f2.get(); f3.get();
 	}
 	{
 		std::lock_guard<std::mutex> lk(mux);
@@ -82,12 +226,18 @@ void DemuxThread::doSeek(double pos)
 	if (!curDemux->Seek(pos))
 	{
 		cout << "[Seek] failed" << endl;
+		{
+			std::lock_guard<std::mutex> lk(mux);
+			lastError_ = curDemux->LastError();
+		}
+		isBuffering = false;
 		if (!wasPause)
 		{
 			isPause = false;
 			pauseCv_.notify_one();
 			if (curAt) curAt->SetPause(false);
 			if (curVt) curVt->SetPause(false);
+			if (curSt) curSt->SetPause(false);
 		}
 		return;
 	}
@@ -96,7 +246,6 @@ void DemuxThread::doSeek(double pos)
 	if (curVt) curVt->ResetSync(seekPts);
 	pts = seekPts;
 
-	// 立即更新进度条位置，避免显示旧值导致"先退后进"的闪烁
 	if (curAt) {
 		long long audioClock = curAt->GetAudioClock();
 		if (audioClock > 0) pts = audioClock;
@@ -108,6 +257,7 @@ void DemuxThread::doSeek(double pos)
 	const int AUDIO_PRE_FILL_COUNT = 10;
 	std::vector<AVPacket*> pendingAudio;
 	std::vector<AVPacket*> pendingVideo;
+	std::vector<AVPacket*> pendingSub;
 	pendingAudio.reserve(80);
 	pendingVideo.reserve(80);
 
@@ -123,8 +273,13 @@ void DemuxThread::doSeek(double pos)
 			pendingAudio.push_back(pkt);
 			audioPreFill++;
 		}
-		else
+		else if (curDemux->IsVideo(pkt))
 		{
+			if (!curVt)
+			{
+				av_packet_free(&pkt);
+				continue;
+			}
 			if (!frameShown)
 			{
 				long long decodedPts = 0;
@@ -145,8 +300,19 @@ void DemuxThread::doSeek(double pos)
 				pendingVideo.push_back(pkt);
 			}
 		}
+		else if (curDemux->IsSubtitle(pkt))
+		{
+			if (curSt) pendingSub.push_back(pkt);
+			else av_packet_free(&pkt);
+		}
+		else
+		{
+			av_packet_free(&pkt);
+		}
 
 		if (frameShown && audioPreFill >= AUDIO_PRE_FILL_COUNT) break;
+		if (!curAt && frameShown) break;
+		if (!curVt && audioPreFill >= AUDIO_PRE_FILL_COUNT) break;
 	}
 
 	auto& pool = GlobalThreadPool::Instance();
@@ -164,9 +330,18 @@ void DemuxThread::doSeek(double pos)
 			else av_packet_free(&p);
 		}
 	});
+	auto subFuture = pool.submitTask([curSt, pendingSub]() {
+		for (auto* p : pendingSub)
+		{
+			if (curSt) curSt->Push(p);
+			else av_packet_free(&p);
+		}
+	});
 	audioFuture.get();
 	videoFuture.get();
+	subFuture.get();
 
+	isBuffering = false;
 	if (!wasPause)
 	{
 		isPause = false;
@@ -182,6 +357,7 @@ void DemuxThread::doSeek(double pos)
 			curVt->speed = curSpeed;
 			curVt->SetPause(false);
 		}
+		if (curSt) curSt->SetPause(false);
 	}
 	else
 	{
@@ -204,6 +380,7 @@ void DemuxThread::SetPause(bool p)
 	std::lock_guard<std::mutex> lk(mux);
 	if (at) at->SetPause(p);
 	if (vt) vt->SetPause(p);
+	if (st) st->SetPause(p);
 }
 
 void DemuxThread::SetVolume(int volume)
@@ -268,11 +445,13 @@ void DemuxThread::run()
 		MediaDemuxer *curDemux = nullptr;
 		VideoThread *curVt = nullptr;
 		AudioThread *curAt = nullptr;
+		SubtitleThread *curSt = nullptr;
 		{
 			std::lock_guard<std::mutex> lk(mux);
 			curDemux = demux;
 			curVt = vt;
 			curAt = at;
+			curSt = st;
 		}
 		if (!curDemux) { msleep(5); continue; }
 
@@ -287,31 +466,47 @@ void DemuxThread::run()
 			pts = curVt->getPts();
 		}
 
-		if (curVt && curVt->GetPackCount() > curVt->maxList)
+		int vq = curVt ? curVt->GetPackCount() : 0;
+		int aq = curAt ? curAt->GetPackCount() : 0;
+		if ((curVt && vq > curVt->maxList) || (curAt && aq > curAt->maxList) ||
+			(curSt && curSt->GetPackCount() > curSt->maxList))
 		{
-			msleep(1);
-			continue;
-		}
-		if (curAt && curAt->GetPackCount() > curAt->maxList)
-		{
+			isBuffering = false;
 			msleep(1);
 			continue;
 		}
 
+		// Starving decode queues => show buffering for network streams.
+		if ((curVt || curAt) && vq == 0 && aq == 0)
+			isBuffering = true;
+
 		AVPacket *pkt = curDemux->Read();
 		if (!pkt)
 		{
-			isEof = true;
-			isPause = true;
-			if (curAt) curAt->SetPause(true);
-			if (curVt) curVt->SetPause(true);
+			if (curDemux->IsEof())
+			{
+				isEof = true;
+				isPause = true;
+				isBuffering = false;
+				if (curAt) curAt->SetPause(true);
+				if (curVt) curVt->SetPause(true);
+				if (curSt) curSt->SetPause(true);
+			}
+			else
+			{
+				isBuffering = true;
+				msleep(5);
+			}
 			continue;
 		}
+
+		isBuffering = false;
 
 		if (seekPos_.load() >= 0.0)
 		{
 			if (curAt) curAt->RecyclePacket(pkt);
 			else if (curVt) curVt->RecyclePacket(pkt);
+			else if (curSt) curSt->RecyclePacket(pkt);
 			else av_packet_free(&pkt);
 			continue;
 		}
@@ -321,48 +516,76 @@ void DemuxThread::run()
 			if (curAt) curAt->Push(pkt);
 			else av_packet_free(&pkt);
 		}
-		else
+		else if (curDemux->IsVideo(pkt))
 		{
 			if (curVt) curVt->Push(pkt);
+			else av_packet_free(&pkt);
+		}
+		else if (curDemux->IsSubtitle(pkt))
+		{
+			if (curSt) curSt->Push(pkt);
+			else av_packet_free(&pkt);
+		}
+		else
+		{
+			if (curAt) curAt->RecyclePacket(pkt);
+			else if (curVt) curVt->RecyclePacket(pkt);
 			else av_packet_free(&pkt);
 		}
 	}
 }
 
-bool DemuxThread::Open(const char *url, IVideoCallback *call)
+bool DemuxThread::Open(const char *url, IVideoCallback *call, ISubtitleCallback *subCall)
 {
-	if (!url || url[0] == '\0') return false;
+	if (!url || url[0] == '\0')
+	{
+		lastError_ = "empty url";
+		return false;
+	}
+
+	isOpening = true;
+	isBuffering = true;
 
 	mux.lock();
+	if (subCall) subCallback_ = subCall;
+	DemuxOpenOptions opts = openOpts_;
 	auto *oldVt = vt;
 	auto *oldAt = at;
+	auto *oldSt = st;
 	auto *oldDemux = demux;
 	if (oldVt) oldVt->isExit = true;
 	if (oldAt) oldAt->isExit = true;
+	if (oldSt) oldSt->isExit = true;
 	vt = nullptr;
 	at = nullptr;
+	st = nullptr;
 	demux = nullptr;
 	mux.unlock();
 
-	if (oldVt || oldAt || oldDemux)
+	if (oldVt || oldAt || oldSt || oldDemux)
 	{
 		auto& pool = GlobalThreadPool::Instance();
 		auto f1 = pool.submitTask([](VideoThread *t) { if(t) { t->Close(); delete t; } }, oldVt);
 		auto f2 = pool.submitTask([](AudioThread *t) { if(t) { t->Close(); delete t; } }, oldAt);
-		auto f3 = pool.submitTask([](MediaDemuxer *t) { if(t) { t->Close(); delete t; } }, oldDemux);
-		f1.get(); f2.get(); f3.get();
+		auto f3 = pool.submitTask([](SubtitleThread *t) { if(t) { t->Close(); delete t; } }, oldSt);
+		auto f4 = pool.submitTask([](MediaDemuxer *t) { if(t) { t->Close(); delete t; } }, oldDemux);
+		f1.get(); f2.get(); f3.get(); f4.get();
 	}
 
 	mux.lock();
 	seekPos_ = -1.0;
 	isEof = false;
 	isPause = false;
+	lastError_.clear();
 
 	demux = new MediaDemuxer();
-	if (!demux->Open(url))
+	if (!demux->Open(url, opts))
 	{
+		lastError_ = demux->LastError();
 		mux.unlock();
 		delete demux; demux = nullptr;
+		isOpening = false;
+		isBuffering = false;
 		return false;
 	}
 
@@ -374,7 +597,7 @@ bool DemuxThread::Open(const char *url, IVideoCallback *call)
 		AVCodecParameters *vpara = demux->CopyVPara();
 		if (vpara)
 		{
-			if (!vt->Open(vpara, call, demux->width, demux->height))
+			if (!vt->Open(vpara, call, demux->width, demux->height, opts.tryHwAccel))
 			{
 				delete vt; vt = nullptr;
 			}
@@ -398,8 +621,11 @@ bool DemuxThread::Open(const char *url, IVideoCallback *call)
 
 	if (!vt && !at)
 	{
+		lastError_ = "no playable audio/video stream";
 		mux.unlock();
 		delete demux; demux = nullptr;
+		isOpening = false;
+		isBuffering = false;
 		return false;
 	}
 
@@ -414,10 +640,13 @@ bool DemuxThread::Open(const char *url, IVideoCallback *call)
 		at->SetDecoderRecycler([capturedAt](AVPacket *p) { capturedAt->RecyclePacket(p); });
 	}
 
+	openSubtitleLocked();
+
 	demux->SetPacketAllocator([this]() -> AVPacket* {
 		AVPacket *pkt = nullptr;
 		if (at) pkt = at->AllocPacket();
 		else if (vt) pkt = vt->AllocPacket();
+		else if (st) pkt = st->AllocPacket();
 		return pkt ? pkt : av_packet_alloc();
 	});
 
@@ -431,6 +660,8 @@ bool DemuxThread::Open(const char *url, IVideoCallback *call)
 
 	mux.unlock();
 
+	isOpening = false;
+	isBuffering = false;
 	cout << "[Demux] Open OK" << endl;
 	return true;
 }
@@ -443,27 +674,34 @@ void DemuxThread::Close()
 		std::lock_guard<std::mutex> lk(mux);
 		if (vt) vt->isExit = true;
 		if (at) at->isExit = true;
+		if (st) st->isExit = true;
 	}
 	wait();
 	AudioThread *oldAt = nullptr;
 	VideoThread *oldVt = nullptr;
+	SubtitleThread *oldSt = nullptr;
 	MediaDemuxer *oldDemux = nullptr;
 	{
 		std::lock_guard<std::mutex> lk(mux);
 		oldAt = at; at = nullptr;
 		oldVt = vt; vt = nullptr;
+		oldSt = st; st = nullptr;
 		oldDemux = demux; demux = nullptr;
 	}
 
 	auto& pool = GlobalThreadPool::Instance();
 	auto f1 = pool.submitTask([](AudioThread *t) { if (t) t->Close(); }, oldAt);
 	auto f2 = pool.submitTask([](VideoThread *t) { if (t) t->Close(); }, oldVt);
-	auto f3 = pool.submitTask([](MediaDemuxer *t) { if (t) t->Close(); }, oldDemux);
-	f1.get(); f2.get(); f3.get();
+	auto f3 = pool.submitTask([](SubtitleThread *t) { if (t) t->Close(); }, oldSt);
+	auto f4 = pool.submitTask([](MediaDemuxer *t) { if (t) t->Close(); }, oldDemux);
+	f1.get(); f2.get(); f3.get(); f4.get();
 
 	delete oldAt;
 	delete oldVt;
+	delete oldSt;
 	delete oldDemux;
+	isBuffering = false;
+	isOpening = false;
 }
 
 void DemuxThread::Start()

@@ -2,11 +2,11 @@ TEMPLATE = app
 TARGET = FFMediaPlayer
 VERSION = 1.0.0
 
-QT += core opengl gui multimedia widgets
+QT += core opengl gui multimedia widgets network
 CONFIG += c++17 console debug_and_release
 CONFIG -= debug_and_release_target
 
-DEFINES += QT_DLL QT_OPENGL_LIB QT_OPENGLEXTENSIONS_LIB QT_WIDGETS_LIB QT_MULTIMEDIA_LIB
+DEFINES += QT_DLL QT_OPENGL_LIB QT_OPENGLEXTENSIONS_LIB QT_WIDGETS_LIB QT_MULTIMEDIA_LIB QT_NETWORK_LIB
 
 INCLUDEPATH += ./GeneratedFiles \
     . \
@@ -16,8 +16,12 @@ INCLUDEPATH += ./GeneratedFiles \
     ../Core \
     ../Thread \
     ../../ThreadPool \
-    ../../MemoryPool \
-    ../../LockFree
+    ../../LockFree \
+    $$PWD/../../../third_party/my-MemoryPool/v3/include \
+    $$PWD/../../../third_party/my-MemoryPool/v3/src
+
+# Link my-MemoryPool v3 statically into the app (no shared-lib export macros).
+DEFINES += KAMA_MEMORY_POOL_STATS_ENABLED=0
 
 DEPENDPATH += .
 
@@ -65,7 +69,7 @@ unix {
     QMAKE_LFLAGS += -Wl,--no-as-needed
 }
 
-LIBS += -lavcodec -lavformat -lavutil -lswresample -lswscale -lavfilter -lavdevice
+LIBS += -lavcodec -lavformat -lavutil -lswresample -lswscale
 
 unix {
     LIBS += -latomic

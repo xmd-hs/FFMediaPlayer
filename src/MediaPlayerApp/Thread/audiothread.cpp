@@ -2,7 +2,7 @@
 #include "mediadecoder.h"
 #include "audioplayer.h"
 #include "audioresampler.h"
-#include "MemoryPool.h"
+#include <kama/MemoryPool.h>
 #include <iostream>
 extern "C" {
 #include <libavutil/frame.h>
@@ -31,7 +31,12 @@ void AudioThread::Close()
 {
 	DecodeThread::Close();
 	std::lock_guard<std::mutex> lk(amux);
-	if (ap) { ap->Close(); ap = nullptr; }
+	if (ap)
+	{
+		ap->Close();
+		// Keep the singleton pointer; next Open() will AudioPlayer::Get() + Open().
+		ap = nullptr;
+	}
 	if (res) { delete res; res = nullptr; }
 }
 

@@ -1,5 +1,6 @@
 #include "videothread.h"
 #include "mediadecoder.h"
+#include "GlobalThreadPool.h"
 #include <iostream>
 extern "C" {
 #include <libavutil/frame.h>
@@ -8,30 +9,56 @@ extern "C" {
 }
 using namespace std;
 
-static AVFrame* ToYuv420P(AVFrame *src)
+void VideoThread::FreeSws()
+{
+	std::lock_guard<std::mutex> lk(vmux);
+	if (swsCtx_)
+	{
+		sws_freeContext(swsCtx_);
+		swsCtx_ = nullptr;
+	}
+	swsSrcW_ = 0;
+	swsSrcH_ = 0;
+	swsSrcFmt_ = -1;
+}
+
+AVFrame* VideoThread::ToYuv420P(AVFrame *src)
 {
 	if (!src) return nullptr;
 	if (src->format == AV_PIX_FMT_YUV420P) return src;
-	SwsContext *sws = sws_getContext(src->width, src->height,
-		(AVPixelFormat)src->format, src->width, src->height,
-		AV_PIX_FMT_YUV420P, SWS_BILINEAR, nullptr, nullptr, nullptr);
-	if (!sws) { av_frame_free(&src); return nullptr; }
+
+	std::lock_guard<std::mutex> lk(vmux);
+	if (!swsCtx_ || swsSrcW_ != src->width || swsSrcH_ != src->height ||
+		swsSrcFmt_ != src->format)
+	{
+		if (swsCtx_)
+		{
+			sws_freeContext(swsCtx_);
+			swsCtx_ = nullptr;
+		}
+		swsCtx_ = sws_getContext(src->width, src->height,
+			(AVPixelFormat)src->format, src->width, src->height,
+			AV_PIX_FMT_YUV420P, SWS_BILINEAR, nullptr, nullptr, nullptr);
+		if (!swsCtx_) { av_frame_free(&src); return nullptr; }
+		swsSrcW_ = src->width;
+		swsSrcH_ = src->height;
+		swsSrcFmt_ = src->format;
+	}
+
 	AVFrame *dst = av_frame_alloc();
-	if (!dst) { sws_freeContext(sws); av_frame_free(&src); return nullptr; }
+	if (!dst) { av_frame_free(&src); return nullptr; }
 	dst->format = AV_PIX_FMT_YUV420P;
 	dst->width = src->width;
 	dst->height = src->height;
 	if (av_frame_get_buffer(dst, 32) < 0 ||
-		sws_scale(sws, src->data, src->linesize, 0, src->height,
+		sws_scale(swsCtx_, src->data, src->linesize, 0, src->height,
 			dst->data, dst->linesize) <= 0)
 	{
 		av_frame_free(&dst);
-		sws_freeContext(sws);
 		av_frame_free(&src);
 		return nullptr;
 	}
 	dst->pts = src->pts;
-	sws_freeContext(sws);
 	av_frame_free(&src);
 	return dst;
 }
@@ -44,6 +71,7 @@ void VideoThread::Close()
 	isExit = true;
 	DecodeThread::Close();
 	if (repaintFuture_.valid()) repaintFuture_.get();
+	FreeSws();
 }
 
 long long VideoThread::getPts()
@@ -63,10 +91,11 @@ void VideoThread::Clear()
 	lastFrameTime = std::chrono::steady_clock::now();
 }
 
-bool VideoThread::Open(AVCodecParameters *para, IVideoCallback *call, int width, int height)
+bool VideoThread::Open(AVCodecParameters *para, IVideoCallback *call, int width, int height, bool tryHwAccel)
 {
 	if (!para) return false;
 	Clear();
+	FreeSws();
 
 	{
 		std::lock_guard<std::mutex> lk(vmux);
@@ -75,8 +104,9 @@ bool VideoThread::Open(AVCodecParameters *para, IVideoCallback *call, int width,
 		if (call) call->Init(width, height);
 	}
 
-	bool ok = decode->Open(para);
-	cout << "[Video] open " << (ok ? "OK" : "FAIL") << endl;
+	bool ok = decode->Open(para, tryHwAccel);
+	cout << "[Video] open " << (ok ? "OK" : "FAIL")
+		<< (ok && decode->UsingHwAccel() ? " (HW)" : "") << endl;
 	return ok;
 }
 

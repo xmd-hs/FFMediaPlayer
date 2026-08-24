@@ -1,0 +1,35 @@
+# Build outputs
+bin/
+build/
+**/GeneratedFiles/
+**/*.o
+**/*.obj
+**/*.a
+**/*.lib
+**/*.exe
+**/*.dll
+**/*.dylib
+
+# qmake / Qt Creator
+*.pro.user
+*.pro.user.*
+*.qmake.stash
+Makefile
+Makefile.*
+moc_*.cpp
+moc_*.h
+qrc_*.cpp
+ui_*.h
+*.moc
+
+# IDE / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
+
+# Local cmake leftovers
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/

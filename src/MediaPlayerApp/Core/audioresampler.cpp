@@ -1,5 +1,5 @@
 #include "audioresampler.h"
-#include "MemoryPool.h"
+#include <kama/MemoryPool.h>
 #include "GlobalThreadPool.h"
 extern "C" {
 #include <libswresample/swresample.h>
@@ -9,6 +9,8 @@ extern "C" {
 }
 #include <iostream>
 #include <vector>
+#include <thread>
+#include <future>
 using namespace std;
 
 AudioResampler::AudioResampler() {}
@@ -138,15 +140,17 @@ int AudioResampler::Resample(AVFrame *indata, unsigned char *d, int dataSize)
 	if (!indata) return 0;
 	if (!d || dataSize <= 0) { av_frame_free(&indata); return 0; }
 
-	mux.lock();
-	if (!actx) { mux.unlock(); av_frame_free(&indata); return 0; }
+	// Hold mux for the full conversion so SetSpeed/Close cannot free tempBuf_
+	// or change curSpeed mid-copy.
+	std::lock_guard<std::mutex> lk(mux);
+	if (!actx) { av_frame_free(&indata); return 0; }
 
 	int outSamples = (int)(indata->nb_samples * (outSampleRate / (double)inSampleRate));
 	if (outSamples < indata->nb_samples) outSamples = indata->nb_samples;
 
 	int bytesPerSample = av_get_bytes_per_sample(outFormat);
 	int sampleSize = 2 * bytesPerSample;
-	size_t needSize = outSamples * sampleSize;
+	size_t needSize = (size_t)outSamples * (size_t)sampleSize;
 
 	if (needSize > tempBufSize_)
 	{
@@ -157,7 +161,6 @@ int AudioResampler::Resample(AVFrame *indata, unsigned char *d, int dataSize)
 		if (!tempBuf_)
 		{
 			tempBufSize_ = 0;
-			mux.unlock();
 			av_frame_free(&indata);
 			return 0;
 		}
@@ -167,22 +170,22 @@ int AudioResampler::Resample(AVFrame *indata, unsigned char *d, int dataSize)
 	data[0] = tempBuf_;
 	int re = swr_convert(actx, data, outSamples,
 		(const uint8_t**)indata->data, indata->nb_samples);
-	mux.unlock();
 
 	if (re <= 0) {
 		av_frame_free(&indata);
 		return 0;
 	}
 
+	const double speed = curSpeed;
 	int finalSamples = re;
-	if (curSpeed != 1.0) {
-		finalSamples = (int)(re / curSpeed);
+	if (speed != 1.0) {
+		finalSamples = (int)(re / speed);
 		if (finalSamples < 1) finalSamples = 1;
 
 		int maxSamples = dataSize / sampleSize;
 		if (finalSamples > maxSamples) finalSamples = maxSamples;
 
-		int maxValidDst = (int)((double)re / curSpeed) - 1;
+		int maxValidDst = (int)((double)re / speed) - 1;
 		if (maxValidDst < 0) maxValidDst = 0;
 		if (finalSamples > maxValidDst + 1) finalSamples = maxValidDst + 1;
 
@@ -191,7 +194,6 @@ int AudioResampler::Resample(AVFrame *indata, unsigned char *d, int dataSize)
 			int numChunks = std::min((int)std::thread::hardware_concurrency(), (finalSamples + 255) / 256);
 			if (numChunks < 2) numChunks = 2;
 			int chunkSize = (finalSamples + numChunks - 1) / numChunks;
-			double speed = curSpeed;
 			unsigned char* srcBuf = tempBuf_;
 			std::vector<std::future<void>> futures;
 			for (int c = 0; c < numChunks; c++) {
@@ -207,7 +209,7 @@ int AudioResampler::Resample(AVFrame *indata, unsigned char *d, int dataSize)
 			}
 			for (auto& f : futures) f.get();
 		} else {
-			double step = curSpeed;
+			double step = speed;
 			double pos = 0.0;
 			int dstPos = 0;
 			while (pos < re && dstPos < finalSamples) {
@@ -223,6 +225,7 @@ int AudioResampler::Resample(AVFrame *indata, unsigned char *d, int dataSize)
 		int copyBytes = re * sampleSize;
 		if (copyBytes > dataSize) copyBytes = dataSize;
 		memcpy(d, tempBuf_, copyBytes);
+		finalSamples = copyBytes / sampleSize;
 	}
 
 	av_frame_free(&indata);

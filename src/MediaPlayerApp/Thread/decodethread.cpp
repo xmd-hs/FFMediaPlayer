@@ -1,7 +1,5 @@
 #include "decodethread.h"
 #include "mediadecoder.h"
-#include "LockFreeQueue.hpp"
-#include "LockFreeStack.hpp"
 extern "C" {
 #include <libavcodec/avcodec.h>
 }
@@ -24,9 +22,13 @@ void DecodeThread::Close()
 
 void DecodeThread::Clear()
 {
+	// Block Push before touching the queue so reset() is not concurrent with push.
 	isClearing = true;
-	std::lock_guard<std::mutex> lk(mux);
-	if (decode) decode->Clear();
+	std::lock_guard<std::mutex> packLk(packMux_);
+	{
+		std::lock_guard<std::mutex> lk(mux);
+		if (decode) decode->Clear();
+	}
 	AVPacket *pkt = nullptr;
 	while (packs_.pop(pkt))
 	{
@@ -49,9 +51,29 @@ AVPacket *DecodeThread::Pop()
 void DecodeThread::Push(AVPacket *pkt)
 {
 	if (!pkt) return;
-	while (!packs_.push(pkt))
+	for (;;)
 	{
-		if (isExit) { RecyclePacket(pkt); return; }
+		if (isExit.load() || isClearing.load())
+		{
+			RecyclePacket(pkt);
+			return;
+		}
+		{
+			std::lock_guard<std::mutex> packLk(packMux_);
+			if (isExit.load() || isClearing.load())
+			{
+				RecyclePacket(pkt);
+				return;
+			}
+			if (packs_.push(pkt))
+				return;
+		}
+		// Queue full: release lock and retry so Clear can proceed.
+		if (isExit.load() || isClearing.load())
+		{
+			RecyclePacket(pkt);
+			return;
+		}
 		std::this_thread::yield();
 	}
 }

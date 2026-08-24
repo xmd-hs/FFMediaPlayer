@@ -5,7 +5,7 @@
 #include <QOpenGLShaderProgram>
 #include <QMutex>
 #include "ivideocallback.h"
-#include "MemoryPool.h"
+#include <kama/MemoryPool.h>
 #include "GlobalThreadPool.h"
 
 /**

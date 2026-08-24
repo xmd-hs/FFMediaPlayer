@@ -6,6 +6,7 @@ class MediaDecoder;
 #include <mutex>
 #include <atomic>
 #include <thread>
+#include <functional>
 #include <QThread>
 
 class DecodeThread : public QThread
@@ -29,4 +30,5 @@ protected:
 	LockFreeQueue<AVPacket*, 128> packs_;
 	LockFreeStack<AVPacket*> freePackets_;
 	std::mutex mux;
+	std::mutex packMux_;
 };

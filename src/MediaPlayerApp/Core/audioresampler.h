@@ -5,7 +5,6 @@ struct AVFrame;
 struct SwrContext;
 struct AVChannelLayout;
 #include <mutex>
-#include <atomic>
 extern "C" {
 #include <libavutil/samplefmt.h>
 }
