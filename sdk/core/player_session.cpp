@@ -43,6 +43,9 @@ bool PlayerSession::open(const std::string& url)
         const bool opened = videoDecoder_.open(vp);
         avcodec_parameters_free(&vp);
         if (!opened) {
+            if (errorCallback_) {
+                errorCallback_(videoDecoder_.lastError());
+            }
             close();
             setState(PlaybackState::Error);
             return false;
@@ -52,6 +55,9 @@ bool PlayerSession::open(const std::string& url)
         const bool opened = audioDecoder_.open(ap);
         avcodec_parameters_free(&ap);
         if (!opened) {
+            if (errorCallback_) {
+                errorCallback_(audioDecoder_.lastError());
+            }
             close();
             setState(PlaybackState::Error);
             return false;
