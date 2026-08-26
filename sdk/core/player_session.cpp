@@ -39,9 +39,32 @@ bool PlayerSession::open(const std::string& url)
     auto vp = demuxer_.videoParameters();
     auto ap = demuxer_.audioParameters();
     auto sp = demuxer_.subtitleParameters();
-    if (vp) { videoDecoder_.open(vp); avcodec_parameters_free(&vp); }
-    if (ap) { audioDecoder_.open(ap); avcodec_parameters_free(&ap); }
-    if (sp) { subtitleDecoder_.open(sp); avcodec_parameters_free(&sp); }
+    if (vp) {
+        const bool opened = videoDecoder_.open(vp);
+        avcodec_parameters_free(&vp);
+        if (!opened) {
+            close();
+            setState(PlaybackState::Error);
+            return false;
+        }
+    }
+    if (ap) {
+        const bool opened = audioDecoder_.open(ap);
+        avcodec_parameters_free(&ap);
+        if (!opened) {
+            close();
+            setState(PlaybackState::Error);
+            return false;
+        }
+    }
+    if (sp) {
+        const bool opened = subtitleDecoder_.open(sp);
+        avcodec_parameters_free(&sp);
+        if (!opened) {
+            // Subtitle decoding is optional; keep audio/video playback alive.
+            subtitleDecoder_.close();
+        }
+    }
     videoPackets_.restart();
     audioPackets_.restart();
     subtitlePackets_.restart();
