@@ -1,4 +1,5 @@
 # Build outputs
+media/
 bin/
 build/
 **/GeneratedFiles/
@@ -11,6 +12,7 @@ build/
 **/*.dylib
 
 # qmake / Qt Creator
+*.qmake.stash
 *.pro.user
 *.pro.user.*
 *.qmake.stash

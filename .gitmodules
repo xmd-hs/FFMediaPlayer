@@ -1,3 +1,0 @@
-[submodule "third_party/my-MemoryPool"]
-	path = third_party/my-MemoryPool
-	url = https://github.com/xmd-hs/my-MemoryPool.git
