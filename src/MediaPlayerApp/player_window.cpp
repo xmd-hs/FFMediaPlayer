@@ -18,6 +18,19 @@ PlayerWindow::PlayerWindow(QWidget *parent) : QMainWindow(parent)
             status_->setText(playing ? QStringLiteral("播放中") : QStringLiteral("已暂停"));
         }, Qt::QueuedConnection);
     });
+    player_.setErrorCallback([this](const std::string &message) {
+        const QString text = QString::fromUtf8(message.c_str());
+        QMetaObject::invokeMethod(this, [this, text] {
+            status_->setText(QStringLiteral("错误: ") + text);
+            playButton_->setText(QStringLiteral("播放"));
+        }, Qt::QueuedConnection);
+    });
+    player_.setFinishedCallback([this] {
+        QMetaObject::invokeMethod(this, [this] {
+            status_->setText(QStringLiteral("播放结束"));
+            playButton_->setText(QStringLiteral("播放"));
+        }, Qt::QueuedConnection);
+    });
     setWindowTitle(QStringLiteral("FFMediaPlayer"));
     resize(1280, 800);
     setStyleSheet("QMainWindow{background:#050505;color:#f0f0f0;} QWidget{background:#050505;color:#f0f0f0;} QPushButton{background:#171717;color:#f0f0f0;border:1px solid #383838;border-radius:5px;padding:8px 14px;} QPushButton:hover{background:#252525;border-color:#3d8bfd;} QSlider::groove:horizontal{height:4px;background:#303030;} QSlider::sub-page:horizontal{background:#3d8bfd;} QSlider::handle:horizontal{width:14px;margin:-5px 0;background:#ff7b22;border-radius:7px;}");
