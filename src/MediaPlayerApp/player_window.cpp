@@ -78,6 +78,11 @@ PlayerWindow::PlayerWindow(QWidget *parent) : QMainWindow(parent)
     timer_.start();
     connect(volume_, &QSlider::valueChanged, this, [this](int value) { audioSink_.setVolume(value); });
 }
+PlayerWindow::~PlayerWindow()
+{
+    player_.close();
+}
+
 void PlayerWindow::openFile()
 {
     const QString path = QFileDialog::getOpenFileName(

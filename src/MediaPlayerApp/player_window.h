@@ -18,7 +18,9 @@ class QWaitCondition;
 #include "adapters/qt_sinks.h"
 
 class PlayerWindow final : public QMainWindow {
-public: explicit PlayerWindow(QWidget *parent = nullptr);
+public:
+    explicit PlayerWindow(QWidget *parent = nullptr);
+    ~PlayerWindow() override;
 
 private:
     void openFile();
