@@ -80,4 +80,34 @@ AVCodecParameters *FfmpegDemuxer::videoParameters() const { return copyParameter
 AVCodecParameters *FfmpegDemuxer::audioParameters() const { return copyParameters(format_, audioStream_); }
 AVCodecParameters *FfmpegDemuxer::subtitleParameters() const { return copyParameters(format_, subtitleStream_); }
 
+std::vector<TrackInfo> FfmpegDemuxer::audioTracks() const
+{
+    std::vector<TrackInfo> tracks;
+    if (!format_) return tracks;
+    for (unsigned int i = 0; i < format_->nb_streams; ++i) {
+        if (format_->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            TrackInfo track;
+            track.streamIndex = static_cast<int>(i);
+            track.codec = avcodec_get_name(format_->streams[i]->codecpar->codec_id);
+            tracks.push_back(track);
+        }
+    }
+    return tracks;
+}
+
+std::vector<TrackInfo> FfmpegDemuxer::subtitleTracks() const
+{
+    std::vector<TrackInfo> tracks;
+    if (!format_) return tracks;
+    for (unsigned int i = 0; i < format_->nb_streams; ++i) {
+        if (format_->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE) {
+            TrackInfo track;
+            track.streamIndex = static_cast<int>(i);
+            track.codec = avcodec_get_name(format_->streams[i]->codecpar->codec_id);
+            tracks.push_back(track);
+        }
+    }
+    return tracks;
+}
+
 } // namespace ffplayer

@@ -1,4 +1,4 @@
-#include <QApplication>
+﻿#include <QApplication>
 #include "player_window.h"
 
 int main(int argc, char **argv)
