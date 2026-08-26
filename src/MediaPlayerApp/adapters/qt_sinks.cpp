@@ -104,6 +104,13 @@ QtAudioSink::QtAudioSink()
     buffer_ = new QtAudioBuffer(output_);
     output_->start(buffer_);
     device_ = buffer_;
+    QObject::connect(output_, &QAudioOutput::stateChanged,
+                     [this](QAudio::State state) {
+        if ((state == QAudio::IdleState || state == QAudio::StoppedState) &&
+            buffer_ && buffer_->bytesAvailable() > 0) {
+            output_->start(buffer_);
+        }
+    });
 }
 
 QtAudioSink::~QtAudioSink() { delete output_; }
