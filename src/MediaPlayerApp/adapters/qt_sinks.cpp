@@ -60,6 +60,12 @@ qint64 QtAudioBuffer::bytesAvailable() const
     return buffer_.size() + QIODevice::bytesAvailable();
 }
 
+void QtAudioBuffer::clear()
+{
+    QMutexLocker lock(&mutex_);
+    buffer_.clear();
+}
+
 void QtVideoSink::onVideoFrame(const ffplayer::VideoFrame &frame)
 {
     if (!view_ || !frame.data[0] || frame.width <= 0 || frame.height <= 0)
@@ -115,6 +121,17 @@ QtAudioSink::QtAudioSink()
 
 QtAudioSink::~QtAudioSink() { delete output_; }
 void QtAudioSink::setVolume(int percent) { if (output_) output_->setVolume(qBound(0, percent, 100) / 100.0); }
+
+void QtAudioSink::flush()
+{
+    if (buffer_) {
+        buffer_->clear();
+    }
+    if (output_ && buffer_) {
+        output_->stop();
+        output_->start(buffer_);
+    }
+}
 
 bool QtAudioSink::onAudioChunk(const ffplayer::AudioChunk &chunk)
 {

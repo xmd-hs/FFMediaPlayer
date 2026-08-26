@@ -17,6 +17,7 @@ public:
     qint64 readData(char *data, qint64 maxSize) override;
     qint64 writeData(const char *data, qint64 size) override;
     qint64 bytesAvailable() const override;
+    void clear();
 private:
     static constexpr int kMaxBufferBytes = 48000 * 2 * 2 * 2;
     QByteArray buffer_;
@@ -38,6 +39,7 @@ public:
     ~QtAudioSink() override;
     bool onAudioChunk(const ffplayer::AudioChunk &chunk) override;
     void setVolume(int percent);
+    void flush();
 private:
     QAudioOutput *output_ = nullptr;
     QIODevice *device_ = nullptr;

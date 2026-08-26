@@ -80,6 +80,7 @@ PlayerWindow::PlayerWindow(QWidget *parent) : QMainWindow(parent)
     connect(openButton, &QPushButton::clicked, this, &PlayerWindow::openFile);
     connect(playButton_, &QPushButton::clicked, this, &PlayerWindow::togglePlayback);
     connect(progress_, &QSlider::sliderReleased, this, [this] {
+        audioSink_.flush();
         player_.seek(progress_->value());
     });
     timer_.setInterval(250);
