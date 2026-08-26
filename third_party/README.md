@@ -1,6 +1,6 @@
 # Third-party dependencies
 
-- [my-MemoryPool](https://github.com/xmd-hs/my-MemoryPool) v3 — used as git submodule at `third_party/my-MemoryPool`.
+当前播放链路不依赖第三方内存池。此目录仅保留 FFmpeg 依赖说明。
 
 Initialize after clone:
 

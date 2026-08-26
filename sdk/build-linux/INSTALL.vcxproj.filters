@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="D:\面试项目\qt播放器\FFMediaPlayer\sdk\build-linux\CMakeFiles\22229088fbe17c5f8576ea0658185afb\INSTALL_force.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{2523DB0E-DC50-30CD-908F-515CF2961B78}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>
