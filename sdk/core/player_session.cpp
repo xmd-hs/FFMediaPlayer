@@ -288,7 +288,9 @@ void PlayerSession::audioLoop()
         if (!audioPackets_.pop(packet)) break;
         if (!packet) {
             audioDecoder_.sendEndOfStream();
-            while (AVFrame* frame = audioDecoder_.receive()) av_frame_free(&frame);
+            while (AVFrame* frame = audioDecoder_.receive()) {
+                av_frame_free(&frame);
+            }
             if (++eofWorkers_ >= ((demuxer_.videoStream() >= 0) ? 1 : 0) + ((demuxer_.audioStream() >= 0) ? 1 : 0)) {
                 if (!finishedNotified_.exchange(true) && finishedCallback_) finishedCallback_();
             }
@@ -296,39 +298,58 @@ void PlayerSession::audioLoop()
         }
         if (!audioDecoder_.send(packet)) continue;
         while (AVFrame* frame = audioDecoder_.receive()) {
-            if (!resampler_) {
-                AVChannelLayout outLayout = AV_CHANNEL_LAYOUT_STEREO;
-                AVChannelLayout inLayout = frame->ch_layout;
-                swr_alloc_set_opts2(&resampler_, &outLayout, AV_SAMPLE_FMT_S16, 48000, &inLayout, static_cast<AVSampleFormat>(frame->format), frame->sample_rate, 0, nullptr);
-                if (resampler_) swr_init(resampler_);
-            }
-            if (resampler_ && audioSink_) {
-                const int maxSamples = av_rescale_rnd(
-                    swr_get_delay(resampler_, frame->sample_rate) + frame->nb_samples,
-                    48000, frame->sample_rate, AV_ROUND_UP);
-                std::vector<std::uint8_t> pcm(static_cast<std::size_t>(maxSamples) * 2 * sizeof(std::int16_t));
-                std::uint8_t* outData[] = { pcm.data() };
-                const int samples = swr_convert(resampler_, outData, maxSamples,
-                    const_cast<const std::uint8_t**>(frame->extended_data), frame->nb_samples);
-                if (samples > 0) {
-                    AudioChunk chunk;
-                    chunk.data = pcm.data();
-                    chunk.size = samples * 2 * static_cast<int>(sizeof(std::int16_t));
-                    chunk.sampleRate = 48000;
-                    chunk.channels = 2;
-                    chunk.ptsMs = frame->pts;
-                    audioClockMs_ = frame->pts >= 0 ? frame->pts : audioClockMs_.load();
-                    audioSink_->onAudioChunk(chunk);
-                    // PCM 鏍锋湰鏁颁唬琛ㄧ湡瀹炲獟浣撴椂闀匡紝鎺ㄨ繘闊抽涓绘椂閽燂紝
-                    // Advance the master clock by the duration of the emitted PCM.
-                    audioClockMs_ = chunk.ptsMs >= 0
-                        ? chunk.ptsMs + static_cast<MediaTimeMs>(samples * 1000LL / 48000)
-                        : audioClockMs_.load() + static_cast<MediaTimeMs>(samples * 1000LL / 48000);
+            processAudioFrame(frame);
             av_frame_free(&frame);
-                    }
         }
     }
 }
+
+void PlayerSession::processAudioFrame(AVFrame* frame)
+{
+    if (!frame || !audioSink_) {
+        return;
+    }
+
+    if (!resampler_) {
+        AVChannelLayout outputLayout = AV_CHANNEL_LAYOUT_STEREO;
+        AVChannelLayout inputLayout = frame->ch_layout;
+        swr_alloc_set_opts2(
+            &resampler_, &outputLayout, AV_SAMPLE_FMT_S16, 48000,
+            &inputLayout, static_cast<AVSampleFormat>(frame->format),
+            frame->sample_rate, 0, nullptr);
+        if (!resampler_ || swr_init(resampler_) < 0) {
+            swr_free(&resampler_);
+            return;
+        }
+    }
+
+    const int maxSamples = av_rescale_rnd(
+        swr_get_delay(resampler_, frame->sample_rate) + frame->nb_samples,
+        48000, frame->sample_rate, AV_ROUND_UP);
+    if (maxSamples <= 0) {
+        return;
+    }
+
+    std::vector<std::uint8_t> pcm(
+        static_cast<std::size_t>(maxSamples) * 2 * sizeof(std::int16_t));
+    std::uint8_t* outputData[] = {pcm.data()};
+    const int samples = swr_convert(
+        resampler_, outputData, maxSamples,
+        const_cast<const std::uint8_t**>(frame->extended_data), frame->nb_samples);
+    if (samples <= 0) {
+        return;
+    }
+
+    AudioChunk chunk;
+    chunk.data = pcm.data();
+    chunk.size = samples * 2 * static_cast<int>(sizeof(std::int16_t));
+    chunk.sampleRate = 48000;
+    chunk.channels = 2;
+    chunk.ptsMs = frame->pts;
+    audioSink_->onAudioChunk(chunk);
+
+    const MediaTimeMs base = frame->pts >= 0 ? frame->pts : audioClockMs_.load();
+    audioClockMs_ = base + static_cast<MediaTimeMs>(samples * 1000LL / 48000);
 }
 
 PlaybackState PlayerSession::state() const

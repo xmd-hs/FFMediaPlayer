@@ -14,7 +14,8 @@
 #include <QMutexLocker>
 #include <cstring>
 
-QtAudioBuffer::QtAudioBuffer(QObject *parent) : QIODevice(parent)
+QtAudioBuffer::QtAudioBuffer(QObject *parent)
+    : QIODevice(parent)
 {
     open(QIODevice::ReadOnly);
 }
@@ -32,11 +33,23 @@ qint64 QtAudioBuffer::readData(char *data, qint64 maxSize)
 
 qint64 QtAudioBuffer::writeData(const char *data, qint64 size)
 {
-    QMutexLocker lock(&mutex_);
-    constexpr int maxBufferBytes = 48000 * 2 * 2 * 2;
-    const int available = qMax(0, maxBufferBytes - buffer_.size());
-    const int count = qMin(static_cast<int>(size), available);
-    if (count > 0) buffer_.append(data, count);
+    if (!data || size <= 0) {
+        return 0;
+    }
+
+    int count = 0;
+    {
+        QMutexLocker lock(&mutex_);
+        const int available = qMax(0, kMaxBufferBytes - buffer_.size());
+        count = qMin(static_cast<int>(size), available);
+        if (count > 0) {
+            buffer_.append(data, count);
+        }
+    }
+
+    if (count > 0) {
+        QMetaObject::invokeMethod(this, "readyRead", Qt::QueuedConnection);
+    }
     return count;
 }
 
@@ -96,4 +109,3 @@ bool QtAudioSink::onAudioChunk(const ffplayer::AudioChunk &chunk)
         return false;
     return buffer_->writeData(reinterpret_cast<const char *>(chunk.data), chunk.size) == chunk.size;
 }
-

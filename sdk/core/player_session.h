@@ -49,6 +49,7 @@ private:
     void demuxLoop();
     void videoLoop();
     void audioLoop();
+    void processAudioFrame(AVFrame* frame);
     void subtitleLoop();
     MediaTimeMs audioClock() const;
 

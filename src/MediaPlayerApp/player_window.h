@@ -20,7 +20,9 @@ class QWaitCondition;
 class PlayerWindow final : public QMainWindow {
 public: explicit PlayerWindow(QWidget *parent = nullptr);
 
-private: void openFile(); void togglePlayback();
+private:
+    void openFile();
+    void togglePlayback();
     QLabel *videoView_ = nullptr;
     QLabel *status_ = nullptr;
     QPushButton *playButton_ = nullptr;

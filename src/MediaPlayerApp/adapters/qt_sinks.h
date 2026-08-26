@@ -18,6 +18,7 @@ public:
     qint64 writeData(const char *data, qint64 size) override;
     qint64 bytesAvailable() const override;
 private:
+    static constexpr int kMaxBufferBytes = 48000 * 2 * 2 * 2;
     QByteArray buffer_;
     mutable QMutex mutex_;
 };

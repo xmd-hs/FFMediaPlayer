@@ -18,16 +18,21 @@ PlayerWindow::PlayerWindow(QWidget *parent) : QMainWindow(parent)
             status_->setText(playing ? QStringLiteral("播放中") : QStringLiteral("已暂停"));
         }, Qt::QueuedConnection);
     });
-    setWindowTitle("FFMediaPlayer"); resize(1280, 800);
+    setWindowTitle(QStringLiteral("FFMediaPlayer"));
+    resize(1280, 800);
     setStyleSheet("QMainWindow{background:#050505;color:#f0f0f0;} QWidget{background:#050505;color:#f0f0f0;} QPushButton{background:#171717;color:#f0f0f0;border:1px solid #383838;border-radius:5px;padding:8px 14px;} QPushButton:hover{background:#252525;border-color:#3d8bfd;} QSlider::groove:horizontal{height:4px;background:#303030;} QSlider::sub-page:horizontal{background:#3d8bfd;} QSlider::handle:horizontal{width:14px;margin:-5px 0;background:#ff7b22;border-radius:7px;}");
-    auto *root = new QWidget(this); auto *layout = new QVBoxLayout(root); auto *content = new QHBoxLayout; auto *sidebar = new QVBoxLayout;
+    auto *root = new QWidget(this);
+    auto *layout = new QVBoxLayout(root);
+    auto *content = new QHBoxLayout;
+    auto *sidebar = new QVBoxLayout;
     const QStringList navigationLabels = {
         QStringLiteral("\u83dc\u5355"), QStringLiteral("\u641c\u7d22"),
         QStringLiteral("\u9996\u9875"), QStringLiteral("\u97f3\u4e50"),
         QStringLiteral("\u89c6\u9891"), QStringLiteral("\u5217\u8868"),
         QStringLiteral("\u8bbe\u7f6e")};
-    for (const QString &label : navigationLabels)
+    for (const QString &label : navigationLabels) {
         sidebar->addWidget(new QPushButton(label, root));
+    }
     sidebar->addStretch(); content->addLayout(sidebar);
     videoView_ = new QLabel(QStringLiteral("打开文件开始播放"), root);
     videoView_->setAlignment(Qt::AlignCenter);
@@ -37,10 +42,60 @@ PlayerWindow::PlayerWindow(QWidget *parent) : QMainWindow(parent)
     videoSink_.setView(videoView_);
     content->addWidget(videoView_, 1);
     layout->addLayout(content, 1);
-    progress_ = new QSlider(Qt::Horizontal, root); progress_->setRange(0, 0); layout->addWidget(progress_);
-    auto *controls = new QHBoxLayout; auto *openButton = new QPushButton(QStringLiteral("打开文件"), root); playButton_ = new QPushButton(QStringLiteral("播放"), root); status_ = new QLabel(QStringLiteral("就绪"), root); controls->addWidget(openButton); controls->addWidget(playButton_); controls->addWidget(status_); controls->addStretch(); volume_ = new QSlider(Qt::Horizontal, root); volume_->setRange(0, 100); volume_->setValue(100); volume_->setFixedWidth(120); controls->addWidget(new QLabel(QStringLiteral("音量"), root)); controls->addWidget(volume_); layout->addLayout(controls); setCentralWidget(root);
-    connect(openButton, &QPushButton::clicked, this, &PlayerWindow::openFile); connect(playButton_, &QPushButton::clicked, this, &PlayerWindow::togglePlayback); connect(progress_, &QSlider::sliderReleased, this, [this] { player_.seek(progress_->value()); }); timer_.setInterval(250); connect(&timer_, &QTimer::timeout, this, [this] { if (!progress_->isSliderDown()) progress_->setValue(static_cast<int>(player_.position())); }); timer_.start();
+    progress_ = new QSlider(Qt::Horizontal, root);
+    progress_->setRange(0, 0);
+    layout->addWidget(progress_);
+
+    auto *controls = new QHBoxLayout;
+    auto *openButton = new QPushButton(QStringLiteral("打开文件"), root);
+    playButton_ = new QPushButton(QStringLiteral("播放"), root);
+    status_ = new QLabel(QStringLiteral("就绪"), root);
+    volume_ = new QSlider(Qt::Horizontal, root);
+    volume_->setRange(0, 100);
+    volume_->setValue(100);
+    volume_->setFixedWidth(120);
+
+    controls->addWidget(openButton);
+    controls->addWidget(playButton_);
+    controls->addWidget(status_);
+    controls->addStretch();
+    controls->addWidget(new QLabel(QStringLiteral("音量"), root));
+    controls->addWidget(volume_);
+    layout->addLayout(controls);
+    setCentralWidget(root);
+
+    connect(openButton, &QPushButton::clicked, this, &PlayerWindow::openFile);
+    connect(playButton_, &QPushButton::clicked, this, &PlayerWindow::togglePlayback);
+    connect(progress_, &QSlider::sliderReleased, this, [this] {
+        player_.seek(progress_->value());
+    });
+    timer_.setInterval(250);
+    connect(&timer_, &QTimer::timeout, this, [this] {
+        if (!progress_->isSliderDown()) {
+            progress_->setValue(static_cast<int>(player_.position()));
+        }
+    });
+    timer_.start();
     connect(volume_, &QSlider::valueChanged, this, [this](int value) { audioSink_.setVolume(value); });
 }
-void PlayerWindow::openFile() { const QString path = QFileDialog::getOpenFileName(this, QStringLiteral("打开文件")); if (path.isEmpty() || !player_.open(path.toStdString())) return; progress_->setRange(0, static_cast<int>(player_.duration())); player_.play(); videoView_->setText(path); playButton_->setText(QStringLiteral("暂停")); }
-void PlayerWindow::togglePlayback() { if (player_.state() == ffplayer::PlaybackState::Playing) { player_.pause(); playButton_->setText(QStringLiteral("播放")); } else { player_.play(); playButton_->setText(QStringLiteral("暂停")); } }
+void PlayerWindow::openFile()
+{
+    const QString path = QFileDialog::getOpenFileName(
+        this, QStringLiteral("打开文件"));
+    if (path.isEmpty() || !player_.open(path.toStdString())) {
+        return;
+    }
+
+    progress_->setRange(0, static_cast<int>(player_.duration()));
+    videoView_->setText(path);
+    player_.play();
+}
+
+void PlayerWindow::togglePlayback()
+{
+    if (player_.state() == ffplayer::PlaybackState::Playing) {
+        player_.pause();
+        return;
+    }
+    player_.play();
+}
