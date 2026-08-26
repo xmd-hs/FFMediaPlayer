@@ -11,6 +11,7 @@
 #include <QAudioFormat>
 #include <QBuffer>
 #include <QMetaObject>
+#include <QPointer>
 #include <QMutexLocker>
 #include <cstring>
 
@@ -79,7 +80,14 @@ void QtVideoSink::onVideoFrame(const ffplayer::VideoFrame &frame)
             dst[x] = qRgb(r, g, b);
         }
     }
-    QMetaObject::invokeMethod(view_, [view = view_, image] { view->setPixmap(QPixmap::fromImage(image).scaled(view->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation)); }, Qt::QueuedConnection);
+    QPointer<QLabel> view = view_;
+    QMetaObject::invokeMethod(view_, [view, image] {
+        if (!view) {
+            return;
+        }
+        view->setPixmap(QPixmap::fromImage(image).scaled(
+            view->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+    }, Qt::QueuedConnection);
 }
 
 QtAudioSink::QtAudioSink()
