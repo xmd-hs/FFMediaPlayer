@@ -6,6 +6,12 @@ if (NOT FFMPEG_ROOT AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/../third_party/ffmpeg"
     set(FFMPEG_ROOT "${CMAKE_CURRENT_LIST_DIR}/../third_party/ffmpeg")
 endif()
 
+# Portable core = C++17 + FFmpeg only.
+# Platform zero-copy bridges are optional and live under platform/.
+option(FFPLAYER_ENABLE_HWACCEL
+    "Link optional platform HW decode / zero-copy bridges (VideoToolbox, D3D11, VAAPI)"
+    ON)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -15,9 +21,9 @@ if (PkgConfig_FOUND AND NOT FFMPEG_ROOT)
         libavformat libavcodec libavutil libswresample libswscale libavfilter)
 endif()
 
+set(FFPLAYER_HAS_FFMPEG_LOCAL FALSE)
 if (NOT TARGET PkgConfig::FFMPEG)
     if (FFMPEG_ROOT)
-        # Prefer the checked-in FFmpeg SDK and ignore stale cache entries.
         set(FFMPEG_INCLUDE_DIR "${FFMPEG_ROOT}/include" CACHE PATH "FFmpeg include directory" FORCE)
     endif()
     find_path(FFMPEG_INCLUDE_DIR libavformat/avformat.h
@@ -43,31 +49,70 @@ if (NOT TARGET PkgConfig::FFMPEG)
     target_include_directories(ffmpeg_local INTERFACE ${FFMPEG_INCLUDE_DIR})
     target_link_libraries(ffmpeg_local INTERFACE ${AVFORMAT_LIBRARY} ${AVCODEC_LIBRARY} ${AVUTIL_LIBRARY} ${SWRESAMPLE_LIBRARY} ${SWSCALE_LIBRARY} ${AVFILTER_LIBRARY})
     add_library(PkgConfig::FFMPEG ALIAS ffmpeg_local)
+    set(FFPLAYER_HAS_FFMPEG_LOCAL TRUE)
 endif()
 
-add_library(ffplayer_sdk STATIC
+# ---- Portable engine (no OS graphics APIs) ----
+set(FFPLAYER_CORE_SOURCES
     core/media_clock.cpp
-    core/player_session.cpp
+    core/player_session_control.cpp
+    core/player_session_sync.cpp
+    core/player_session_demux.cpp
+    core/player_session_video.cpp
+    core/player_session_audio.cpp
+    core/player_session_subtitle.cpp
     core/player.cpp
     core/ffmpeg_demuxer.cpp
     core/ffmpeg_decoder.cpp
     core/audio_tempo.cpp
-    core/frame_pool.cpp)
-target_sources(ffplayer_sdk PRIVATE core/ffmpeg_subtitle_decoder.cpp)
-target_sources(ffplayer_sdk PRIVATE core/hw_frame_bridge.cpp)
-target_sources(ffplayer_sdk PRIVATE platform/audio_sink.cpp platform/video_sink.cpp)
+    core/frame_pool.cpp
+    core/hw_frame_bridge.cpp
+    core/ffmpeg_subtitle_decoder.cpp
+    platform/audio_sink.cpp
+    platform/video_sink.cpp)
 
-target_include_directories(ffplayer_sdk PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/include> $<INSTALL_INTERFACE:include/ffplayer>)
+# ---- Optional platform HW bridge (exactly one translation unit provides hwBridgeOps) ----
+if (FFPLAYER_ENABLE_HWACCEL)
+    if (APPLE)
+        list(APPEND FFPLAYER_CORE_SOURCES platform/hw_bridge_videotoolbox.cpp)
+    elseif (WIN32)
+        list(APPEND FFPLAYER_CORE_SOURCES platform/hw_bridge_d3d11.cpp)
+    elseif (UNIX)
+        list(APPEND FFPLAYER_CORE_SOURCES platform/hw_bridge_vaapi.cpp)
+    else()
+        list(APPEND FFPLAYER_CORE_SOURCES platform/hw_bridge_none.cpp)
+    endif()
+else()
+    list(APPEND FFPLAYER_CORE_SOURCES platform/hw_bridge_none.cpp)
+endif()
+
+add_library(ffplayer_sdk STATIC ${FFPLAYER_CORE_SOURCES})
+
+target_include_directories(ffplayer_sdk PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/include>
+    $<INSTALL_INTERFACE:include/ffplayer>)
 target_include_directories(ffplayer_sdk PRIVATE core)
 target_link_libraries(ffplayer_sdk PRIVATE PkgConfig::FFMPEG)
 target_compile_features(ffplayer_sdk PUBLIC cxx_std_17)
 
-# The SDK target intentionally has no Qt linkage or include path.
+if (FFPLAYER_ENABLE_HWACCEL)
+    target_compile_definitions(ffplayer_sdk PUBLIC FFPLAYER_ENABLE_HWACCEL=1)
+else()
+    target_compile_definitions(ffplayer_sdk PUBLIC FFPLAYER_ENABLE_HWACCEL=0)
+endif()
+
+# No Qt / window-system linkage in the SDK target.
 set_target_properties(ffplayer_sdk PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-install(TARGETS ffplayer_sdk ffmpeg_local EXPORT ffplayer_sdkTargets
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+if (FFPLAYER_HAS_FFMPEG_LOCAL)
+    install(TARGETS ffplayer_sdk ffmpeg_local EXPORT ffplayer_sdkTargets
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+else()
+    install(TARGETS ffplayer_sdk EXPORT ffplayer_sdkTargets
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+endif()
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ffplayer)
 install(EXPORT ffplayer_sdkTargets FILE ffplayer_sdkTargets.cmake
     NAMESPACE ffplayer:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ffplayer_sdk)
@@ -83,11 +128,17 @@ if (UNIX AND NOT APPLE)
     target_link_libraries(ffplayer_sdk PRIVATE pthread)
 endif()
 
-if (APPLE)
-    # VideoToolbox hwaccel (phase-1 hard decode).
-    target_link_libraries(ffplayer_sdk PRIVATE
-        "-framework VideoToolbox"
-        "-framework CoreMedia"
-        "-framework CoreVideo"
-        "-framework CoreFoundation")
+if (FFPLAYER_ENABLE_HWACCEL)
+    if (APPLE)
+        target_link_libraries(ffplayer_sdk PRIVATE
+            "-framework VideoToolbox"
+            "-framework CoreMedia"
+            "-framework CoreVideo"
+            "-framework CoreFoundation")
+    endif()
+    if (WIN32)
+        target_link_libraries(ffplayer_sdk PRIVATE d3d11)
+    endif()
 endif()
+
+message(STATUS "ffplayer_sdk: FFPLAYER_ENABLE_HWACCEL=${FFPLAYER_ENABLE_HWACCEL}")

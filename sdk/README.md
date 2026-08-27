@@ -1,38 +1,58 @@
 # FFMediaPlayer SDK
 
-SDK 是不依赖 Qt 的 C++17 播放核心。应用程序通过 `IVideoSink`、`IAudioSink` 和 `ISubtitleSink` 接收解码后的媒体数据。
+**可移植播放引擎**：核心只依赖 **C++17 + FFmpeg**，不依赖 Qt、窗口系统或音频设备 API。UI 通过 `IVideoSink` / `IAudioSink` / `ISubtitleSink` 接入。
+
+硬解与 GPU 零拷贝是**可选平台插件**（`platform/hw_bridge_*.cpp`），可用 `-DFFPLAYER_ENABLE_HWACCEL=OFF` 编出纯 CPU 引擎。
+
+## 分层
+
+```text
+include/     公共 API（Player、Sink、类型）—— 平台无关
+core/        播放管线（解复用 / 队列 / 解码 / 同步 / 会话）—— 平台无关
+platform/    可选实现
+               audio_sink / video_sink   stub
+               hw_bridge_none            无硬解桥接
+               hw_bridge_videotoolbox    macOS
+               hw_bridge_d3d11           Windows
+               hw_bridge_vaapi           Linux (VAAPI→DRM_PRIME)
+```
+
+`core/` **不包含** `#include <d3d11.h>` / CoreVideo / libva。平台符号通过 `detail::hwBridgeOps()` 注入。
 
 ## 架构
 
 ```text
 Player
-  -> PlayerSession
-     -> FfmpegDemuxer       FFmpeg 解复用
-     -> 数据包队列
-     -> FfmpegDecoder       FFmpeg 解码（视频可硬解，失败回退软解）
-     -> 音频重采样          IAudioSink
-     -> 像素格式转换        IVideoSink
-     -> 字幕解码            ISubtitleSink
+  -> PlayerSession          (control / sync / demux / video / audio / subtitle)
+     -> FfmpegDemuxer
+     -> PacketQueue
+     -> FfmpegDecoder       可选硬解（经 hwBridgeOps 选择设备）
+     -> IAudioSink / IVideoSink / ISubtitleSink
 ```
 
-## 视频硬解
+## 硬解与零拷贝
 
-- **一期**：硬解 + `av_hwframe_transfer_data` 回 CPU，走原有 `onVideoFrame`。
-- **二期（macOS / Windows）**：VideoToolbox 或 D3D11 表面经 `HwVideoFrame` / `onHwVideoFrame` 零拷贝呈图；失败自动回退一期/软解。
+| 构建 | 行为 |
+|------|------|
+| `FFPLAYER_ENABLE_HWACCEL=OFF` | 纯 CPU；不链接 Apple 框架 / d3d11；`hwBridgeOps()==nullptr` |
+| `ON` + macOS | VideoToolbox 硬解 + `CVPixelBuffer` 零拷贝 |
+| `ON` + Windows | D3D11VA + `ID3D11Texture2D` 零拷贝 |
+| `ON` + Linux | VAAPI 硬解 + `AVDRMFrameDescriptor*`（DMA-BUF）零拷贝 |
 
-`Player::setHwAccelEnabled(false)` 可强制软解；`videoHwAccelActive()` 查询是否硬解成功。
+运行时仍可用 `Player::setHwAccelEnabled(false)` 强制软解（仅在编译开启硬解时有效）。
 
-`Player` 是对外唯一入口，`PlayerSession` 负责会话状态、线程、队列、时钟、解复用和解码。SDK 内部不包含 Qt、窗口或平台音频视频 API。
-
-## 编译和安装
+## 编译
 
 ```bash
+# 默认可带平台硬解桥接
 cmake -S sdk -B build-sdk -DFFMPEG_ROOT=/path/to/ffmpeg
 cmake --build build-sdk --config Release
-cmake --install build-sdk --prefix /path/to/install
+
+# 纯可移植 CPU 引擎
+cmake -S sdk -B build-sdk-cpu -DFFPLAYER_ENABLE_HWACCEL=OFF
 ```
 
-如果使用项目内 FFmpeg，CMake 会根据平台查找 `lib/win64`、`lib/linux64` 或 `lib/macOS`。不设置 `FFMPEG_ROOT` 时，可以通过 pkg-config 查找系统 FFmpeg。
+依赖：`avformat`、`avcodec`、`avutil`、`swresample`、`swscale`、`avfilter`。
 
 ## 基本用法
 
@@ -48,13 +68,13 @@ player.play();
 
 Sink 回调中的数据必须在回调返回前消费或复制。销毁 Sink 前应先调用 `player.close()`。
 
-## CMake 集成
+Linux 零拷贝：`HwVideoBackend::VAAPI` 时 `nativeHandle` 为 `AVDRMFrameDescriptor*`，由 `keepAlive` 持有生命周期。
 
-安装 SDK 后：
+## CMake 集成
 
 ```cmake
 find_package(ffplayer_sdk CONFIG REQUIRED)
 target_link_libraries(my_app PRIVATE ffplayer::ffplayer_sdk)
 ```
 
-公共头文件安装在 `include/ffplayer`。平台相关的音频设备和视频渲染应由应用层实现，SDK 只提供统一数据接口。
+公共头文件安装在 `include/ffplayer`。

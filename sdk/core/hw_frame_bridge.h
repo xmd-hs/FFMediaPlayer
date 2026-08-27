@@ -6,13 +6,12 @@ struct AVFrame;
 
 namespace ffplayer {
 
-// Build a zero-copy HwVideoFrame from a hardware AVFrame.
-// Returns false if the format is unsupported (caller should transfer to system memory).
+// Portable entry points. Platform zero-copy is injected via detail::hwBridgeOps()
+// (see platform/hw_bridge_*.cpp). With FFPLAYER_ENABLE_HWACCEL=OFF, these never
+// produce GPU surfaces.
+
 bool makeHwVideoFrame(AVFrame* frame, MediaTimeMs ptsMs, HwVideoFrame& out);
-
 bool isHardwarePixelFormat(int avPixelFormat);
-
-// True when the platform sink can present this hw frame without CPU fallback.
 bool canPresentHwVideoFrame(AVFrame* frame);
 
 } // namespace ffplayer

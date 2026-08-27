@@ -42,7 +42,7 @@ public:
     bool selectSubtitleTrack(int streamIndex);
     void setVolume(float volume);
     void setSpeed(double speed);
-    // Phase-1 hwaccel: hardware decode + transfer to CPU. Default on; soft-fallback on failure.
+    // Hardware decode when FFPLAYER_ENABLE_HWACCEL=1 (CMake). Default on; soft-fallback on failure.
     void setHwAccelEnabled(bool enabled);
     bool hwAccelEnabled() const;
     // True after open() if the video decoder is using hardware acceleration.

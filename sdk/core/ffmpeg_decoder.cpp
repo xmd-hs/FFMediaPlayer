@@ -1,5 +1,10 @@
 #include "ffmpeg_decoder.h"
 #include "frame_pool.h"
+#include "hw_bridge_ops.h"
+
+#ifndef FFPLAYER_ENABLE_HWACCEL
+#define FFPLAYER_ENABLE_HWACCEL 1
+#endif
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -19,16 +24,17 @@ std::string errorText(int code)
     return buffer;
 }
 
-// Prefer the platform's primary decoder; others are attempted as fallbacks.
+// Ask the optional platform bridge for a preferred device; otherwise try none first.
 AVHWDeviceType preferredHwDeviceType()
 {
-#if defined(__APPLE__)
-    return AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
-#elif defined(_WIN32)
-    return AV_HWDEVICE_TYPE_D3D11VA;
+#if !FFPLAYER_ENABLE_HWACCEL
+    return AV_HWDEVICE_TYPE_NONE;
 #else
-    // Broad desktop Linux default; CUDA/Vulkan still tried if advertised by the codec.
-    return AV_HWDEVICE_TYPE_VAAPI;
+    const detail::HwBridgeOps* ops = detail::hwBridgeOps();
+    if (ops && ops->preferredDeviceType) {
+        return static_cast<AVHWDeviceType>(ops->preferredDeviceType());
+    }
+    return AV_HWDEVICE_TYPE_NONE;
 #endif
 }
 
@@ -104,6 +110,11 @@ bool FfmpegDecoder::initContext(const AVCodecParameters* parameters, const AVCod
 
 bool FfmpegDecoder::tryOpenHardware(const AVCodecParameters* parameters, const AVCodec* codec)
 {
+#if !FFPLAYER_ENABLE_HWACCEL
+    (void)parameters;
+    (void)codec;
+    return false;
+#else
     if (parameters->codec_type != AVMEDIA_TYPE_VIDEO) return false;
 
     const AVHWDeviceType preferred = preferredHwDeviceType();
@@ -176,6 +187,7 @@ bool FfmpegDecoder::tryOpenHardware(const AVCodecParameters* parameters, const A
         if (tryOne(candidates[i].type, candidates[i].pixFmt)) return true;
     }
     return false;
+#endif
 }
 
 bool FfmpegDecoder::openSoftware(const AVCodecParameters* parameters, const AVCodec* codec)
@@ -209,7 +221,7 @@ bool FfmpegDecoder::open(const AVCodecParameters* parameters, bool enableHwAccel
         return false;
     }
 
-    if (enableHwAccel && tryOpenHardware(parameters, codec)) return true;
+    if (enableHwAccel && FFPLAYER_ENABLE_HWACCEL && tryOpenHardware(parameters, codec)) return true;
 
     // Soft decode (also the fallback when hardware is unavailable).
     return openSoftware(parameters, codec);

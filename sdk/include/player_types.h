@@ -29,17 +29,21 @@ struct VideoFrame {
 };
 
 // Phase-2 zero-copy: platform hardware surface (do not free nativeHandle manually —
-// keepAlive owns the retain/release).
+// keepAlive owns the retain/release). Optional; when FFPLAYER_ENABLE_HWACCEL=0 the
+// SDK never produces these frames.
 enum class HwVideoBackend {
     None = 0,
     VideoToolbox,
     D3D11,
-    VAAPI,
+    VAAPI, // Linux: nativeHandle is AVDRMFrameDescriptor* (VAAPI→DRM_PRIME)
     CUDA
 };
 
 struct HwVideoFrame {
     HwVideoBackend backend = HwVideoBackend::None;
+    // VideoToolbox: CVPixelBufferRef
+    // D3D11: ID3D11Texture2D*
+    // VAAPI: AVDRMFrameDescriptor* (DMA-BUF fds for EGL/Vulkan import)
     void* nativeHandle = nullptr;
     std::shared_ptr<void> keepAlive;
     int subresourceIndex = 0; // D3D11 texture array slice (data[1] from FFmpeg)

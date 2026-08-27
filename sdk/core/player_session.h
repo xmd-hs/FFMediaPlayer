@@ -13,6 +13,10 @@
 #include "frame_pool.h"
 #include <condition_variable>
 
+#ifndef FFPLAYER_ENABLE_HWACCEL
+#define FFPLAYER_ENABLE_HWACCEL 1
+#endif
+
 struct SwrContext;
 struct SwsContext;
 struct AVPacket;
@@ -20,6 +24,8 @@ struct AVFrame;
 
 namespace ffplayer {
 
+// Playback engine: demux → queues → decode → sinks.
+// Implementation split across player_session_{control,sync,demux,video,audio,subtitle}.cpp.
 class PlayerSession {
 public:
     PlayerSession();
@@ -39,7 +45,14 @@ public:
     void setFinishedCallback(Player::FinishedCallback cb) { finishedCallback_ = std::move(cb); }
     void setVolume(float volume);
     void setSpeed(double speed);
-    void setHwAccelEnabled(bool enabled) { hwAccelEnabled_ = enabled; }
+    void setHwAccelEnabled(bool enabled)
+    {
+#if FFPLAYER_ENABLE_HWACCEL
+        hwAccelEnabled_ = enabled;
+#else
+        (void)enabled;
+#endif
+    }
     bool hwAccelEnabled() const { return hwAccelEnabled_.load(); }
     bool videoHwAccelActive() const { return videoDecoder_.hwAccelActive(); }
 
@@ -139,7 +152,7 @@ private:
     std::atomic<MediaTimeMs> videoClockMs_{0};
     std::atomic<int> eofWorkers_{0};
     std::atomic_bool finishedNotified_{false};
-    std::atomic_bool hwAccelEnabled_{true};
+    std::atomic_bool hwAccelEnabled_{FFPLAYER_ENABLE_HWACCEL != 0};
 };
 
 } // namespace ffplayer
