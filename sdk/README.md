@@ -39,7 +39,12 @@ Player
 | `ON` + Windows | D3D11VA + `ID3D11Texture2D` 零拷贝 |
 | `ON` + Linux | VAAPI 硬解 + `AVDRMFrameDescriptor*`（DMA-BUF）零拷贝 |
 
-运行时仍可用 `Player::setHwAccelEnabled(false)` 强制软解（仅在编译开启硬解时有效）。
+运行时调用 `Player::setHwAccelEnabled()` 会在当前位置重建视频解码器并恢复播放；
+未打开媒体时，它设置下一次 `open()` 的解码偏好（仅在编译开启硬解时有效）。
+
+Windows Qt 示例会在应用目录写入 `ffplayer_hw.log`。出现
+`D3D11 zero-copy verified ... gpu-copy=0` 表示解码纹理已被直接采样；
+软硬解切换会输出 `[ffplayer] hw-switch ...` 到标准错误流。
 
 ## 编译
 
@@ -76,5 +81,9 @@ Linux 零拷贝：`HwVideoBackend::VAAPI` 时 `nativeHandle` 为 `AVDRMFrameDesc
 find_package(ffplayer_sdk CONFIG REQUIRED)
 target_link_libraries(my_app PRIVATE ffplayer::ffplayer_sdk)
 ```
+
+安装包不内置 FFmpeg；消费端需要安装对应平台和架构的 FFmpeg 开发文件。FFmpeg
+不在系统搜索路径时，在配置消费工程时传入
+`-DFFPLAYER_FFMPEG_ROOT=/path/to/ffmpeg`（也可使用 `FFMPEG_ROOT` 环境变量）。
 
 公共头文件安装在 `include/ffplayer`。

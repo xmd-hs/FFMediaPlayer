@@ -131,7 +131,7 @@ int preferredVaapi()
     return static_cast<int>(AV_HWDEVICE_TYPE_VAAPI);
 }
 
-const HwBridgeOps kOps{makeVaapi, canPresentVaapi, preferredVaapi};
+const HwBridgeOps kOps{makeVaapi, canPresentVaapi, preferredVaapi, nullptr};
 
 } // namespace
 

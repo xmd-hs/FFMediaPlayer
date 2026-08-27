@@ -6,6 +6,7 @@
 #include <QRecursiveMutex>
 #include <QString>
 #include <QImage>
+#include <vector>
 #include "../../../sdk/include/player.h"
 
 class QLabel;
@@ -22,7 +23,7 @@ public:
     int bufferedBytes() const;
     void clear();
 private:
-    static constexpr int kMaxBufferBytes = 48000 * 2 * 2 * 2;
+    static constexpr int kMaxBufferBytes = 48000 * 2 * 2 / 4; // 250 ms
     QByteArray buffer_;
     mutable QMutex mutex_;
 };
@@ -38,15 +39,26 @@ public:
     void setD3d11Host(D3d11VideoViewHost *host) { d3dHost_ = host; }
 #endif
     bool supportsHwVideo() const override;
+    ffplayer::VideoPixelFormat preferredSoftwarePixelFormat() const override
+    {
+        return ffplayer::VideoPixelFormat::Bgra32;
+    }
     void onVideoFrame(const ffplayer::VideoFrame &frame) override;
     void onHwVideoFrame(const ffplayer::HwVideoFrame &frame) override;
 private:
     QLabel *softView_ = nullptr;
+    QImage pendingImage_;
+    QMutex pendingImageMutex_;
+    bool imageUpdateScheduled_ = false;
 #if defined(Q_OS_MAC)
     MetalVideoViewHost *metalHost_ = nullptr;
 #endif
 #if defined(Q_OS_WIN)
     D3d11VideoViewHost *d3dHost_ = nullptr;
+    void *pendingHwHandle_ = nullptr;
+    int pendingHwSlice_ = 0;
+    std::shared_ptr<void> pendingHwKeepAlive_;
+    bool hwUpdateScheduled_ = false;
 #endif
 };
 
@@ -56,6 +68,7 @@ public:
     ~QtAudioSink() override;
     bool onAudioChunk(const ffplayer::AudioChunk &chunk) override;
     ffplayer::MediaTimeMs bufferedDurationMs() const override;
+    void setPaused(bool paused) override;
     void flush() override;
     void setVolume(int percent);
     bool isReady() const;
@@ -77,6 +90,7 @@ public:
                     ffplayer::MediaTimeMs startMs,
                     ffplayer::MediaTimeMs endMs) override;
     void onSubtitleImage(const ffplayer::SubtitleImage &image) override;
+    void onSubtitleImages(const std::vector<ffplayer::SubtitleImage> &images) override;
     void onSubtitleClear() override;
 private:
     static QString sanitizeSubtitle(const std::string &text);

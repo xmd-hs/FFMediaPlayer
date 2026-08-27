@@ -5,6 +5,9 @@
 
 #ifdef Q_OS_WIN
 
+class QPaintEngine;
+class QPaintEvent;
+
 class D3d11VideoViewHost final : public QWidget {
     Q_OBJECT
 public:
@@ -14,8 +17,11 @@ public:
     // texture: ID3D11Texture2D* from FFmpeg; keepAlive retains the AVFrame ref.
     void setDecodeTexture(void* texture, int subresourceIndex, std::shared_ptr<void> keepAlive);
     void clearFrame();
+    bool hardwarePresentationAvailable() const;
 
 protected:
+    QPaintEngine* paintEngine() const override;
+    void paintEvent(QPaintEvent* event) override;
     void resizeEvent(QResizeEvent* event) override;
     void showEvent(QShowEvent* event) override;
 

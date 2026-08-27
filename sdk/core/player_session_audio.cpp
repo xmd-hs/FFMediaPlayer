@@ -28,15 +28,54 @@ void PlayerSession::audioLoop()
         const std::uint64_t epoch = seekEpoch_.load();
         if (!packet) {
             if (!epochIsCurrent(epoch) || !demuxAtEof_.load(std::memory_order_acquire)) continue;
-            std::vector<AVFrame*> drained;
             {
                 std::lock_guard<std::mutex> lock(audioCodecMutex_);
                 audioDecoder_.sendEndOfStream();
-                while (AVFrame* frame = audioDecoder_.receive()) drained.push_back(frame);
             }
-            for (AVFrame* frame : drained) {
+            for (;;) {
+                AVFrame* frame = nullptr;
+                {
+                    std::lock_guard<std::mutex> lock(audioCodecMutex_);
+                    frame = audioDecoder_.receive();
+                }
+                if (!frame) break;
                 if (epochIsCurrent(epoch)) processAudioFrame(frame, epoch);
                 av_frame_free(&frame);
+            }
+            // atempo buffers samples internally. Drain them after the decoder
+            // reaches EOF so non-1x playback does not lose its final audio.
+            std::vector<std::int16_t> tail;
+            {
+                std::lock_guard<std::mutex> lock(resamplerMutex_);
+                tempoFilter_.drain(tail);
+            }
+            if (!tail.empty() && audioSink_ && epochIsCurrent(epoch)) {
+                const float volume = volume_.load();
+                if (volume != 1.0f) {
+                    for (auto& sample : tail) {
+                        sample = static_cast<std::int16_t>(std::max(
+                            -32768.f, std::min(32767.f, static_cast<float>(sample) * volume)));
+                    }
+                }
+                AudioChunk chunk;
+                chunk.data = reinterpret_cast<const std::uint8_t*>(tail.data());
+                chunk.size = static_cast<int>(tail.size() * sizeof(std::int16_t));
+                chunk.sampleRate = kOutputSampleRate;
+                chunk.channels = kOutputChannels;
+                chunk.ptsMs = audioClockMs_.load();
+                int writeRetries = 0;
+                while (!stopRequested_ && epochIsCurrent(epoch)) {
+                    if (audioSink_->onAudioChunk(chunk)) {
+                        const int frames = static_cast<int>(tail.size() / kOutputChannels);
+                        audioClockMs_ += static_cast<MediaTimeMs>(
+                            frames * 1000.0 * std::max(0.25, speed_.load()) / kOutputSampleRate);
+                        notifyPlayback();
+                        break;
+                    }
+                    if (++writeRetries > 400) break;
+                    std::unique_lock<std::mutex> lock(playbackMutex_);
+                    playbackCv_.wait_for(lock, std::chrono::milliseconds(5));
+                }
             }
             notifyStreamFinished(epoch);
             continue;
@@ -89,15 +128,21 @@ void PlayerSession::audioLoop()
 void PlayerSession::processAudioFrame(AVFrame* frame, std::uint64_t epoch)
 {
     if (!frame || !audioSink_ || !epochIsCurrent(epoch)) return;
-    if (paused_.load(std::memory_order_acquire) &&
-        eofDrainActive_.load(std::memory_order_acquire)) {
-        return;
-    }
+    if (paused_.load(std::memory_order_acquire)) waitWhilePaused();
+    if (stopRequested_ || !epochIsCurrent(epoch)) return;
 
     const std::uint64_t layoutId = frame->ch_layout.u.mask != 0
         ? frame->ch_layout.u.mask
         : static_cast<std::uint64_t>(frame->ch_layout.nb_channels);
     const double speed = std::max(0.25, std::min(4.0, speed_.load()));
+    const MediaTimeMs frameStartMs = frame->pts;
+    MediaTimeMs outputPtsMs = frameStartMs;
+    MediaTimeMs seekTarget = audioSeekTargetMs_.load(std::memory_order_acquire);
+    if (seekTarget >= 0 && frameStartMs >= 0 && frame->sample_rate > 0) {
+        const MediaTimeMs frameDurationMs = static_cast<MediaTimeMs>(
+            frame->nb_samples * 1000LL / frame->sample_rate);
+        if (frameStartMs + frameDurationMs <= seekTarget) return;
+    }
 
     int samples = 0;
     std::int16_t* pcmSamples = nullptr;
@@ -140,6 +185,15 @@ void PlayerSession::processAudioFrame(AVFrame* frame, std::uint64_t epoch)
 
         pcmSamples = audioPcmScratch_.data();
 
+        if (seekTarget >= 0 && frameStartMs >= 0 && frameStartMs < seekTarget) {
+            const auto skipSamples = static_cast<int>(std::min<MediaTimeMs>(
+                samples,
+                ((seekTarget - frameStartMs) * kOutputSampleRate + 999) / 1000));
+            pcmSamples += skipSamples * kOutputChannels;
+            samples -= skipSamples;
+            outputPtsMs = seekTarget;
+            if (samples <= 0) return;
+        }
         if (std::fabs(speed - 1.0) > 1e-3) {
             if (!tempoFilter_.valid() ||
                 std::fabs(tempoFilter_.tempo() - speed) > 1e-3 ||
@@ -162,6 +216,10 @@ void PlayerSession::processAudioFrame(AVFrame* frame, std::uint64_t epoch)
         }
     }
     if (samples <= 0 || !pcmSamples) return;
+    if (seekTarget >= 0) {
+        audioSeekTargetMs_.compare_exchange_strong(
+            seekTarget, -1, std::memory_order_acq_rel);
+    }
 
     const float volume = volume_.load();
     if (volume != 1.0f) {
@@ -181,23 +239,21 @@ void PlayerSession::processAudioFrame(AVFrame* frame, std::uint64_t epoch)
     chunk.size = samples * kOutputChannels * static_cast<int>(sizeof(std::int16_t));
     chunk.sampleRate = kOutputSampleRate;
     chunk.channels = kOutputChannels;
-    chunk.ptsMs = frame->pts;
+    chunk.ptsMs = outputPtsMs;
 
     int writeRetries = 0;
     while (!stopRequested_) {
         waitWhilePaused();
         if (!epochIsCurrent(epoch)) {
-            if (audioSink_) audioSink_->flush();
             return;
         }
         if (audioSink_->onAudioChunk(chunk)) {
             if (!epochIsCurrent(epoch)) {
-                audioSink_->flush();
                 return;
             }
-            const MediaTimeMs base = frame->pts >= 0 ? frame->pts : audioClockMs_.load();
+            const MediaTimeMs base = outputPtsMs >= 0 ? outputPtsMs : audioClockMs_.load();
             const MediaTimeMs mediaDuration =
-                static_cast<MediaTimeMs>(samples * 1000LL / kOutputSampleRate);
+                static_cast<MediaTimeMs>(samples * 1000.0 * speed / kOutputSampleRate);
             audioClockMs_ = base + std::max<MediaTimeMs>(0, mediaDuration);
             notifyPlayback();
             return;

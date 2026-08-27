@@ -32,10 +32,10 @@ void PlayerSession::notifyPlayback()
 
 void PlayerSession::waitWhilePaused()
 {
-    if (stopRequested_ || eofDrainActive_ || !paused_) return;
+    if (stopRequested_ || !paused_) return;
     std::unique_lock<std::mutex> lock(playbackMutex_);
     playbackCv_.wait(lock, [&] {
-        return stopRequested_ || !paused_ || eofDrainActive_;
+        return stopRequested_ || !paused_;
     });
 }
 
@@ -125,7 +125,9 @@ bool PlayerSession::pushPacket(PacketQueue<AVPacket*>& queue, AVPacket* packet, 
             freePacket(packet);
             return false;
         }
-        if (queue.push(packet, &paused_)) return true;
+        const std::size_t packetBytes = packet && packet->size > 0
+            ? static_cast<std::size_t>(packet->size) : 1;
+        if (queue.push(packet, &paused_, packetBytes)) return true;
         waitWhilePaused();
         if (stopRequested_ || !epochIsCurrent(epoch)) break;
     }

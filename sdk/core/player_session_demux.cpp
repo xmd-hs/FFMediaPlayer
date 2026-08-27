@@ -1,5 +1,9 @@
 #include "player_session.h"
 
+extern "C" {
+#include <libavcodec/packet.h>
+}
+
 #include <mutex>
 #include <string>
 

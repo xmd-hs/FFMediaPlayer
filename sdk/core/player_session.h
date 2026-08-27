@@ -39,22 +39,18 @@ public:
     void pause();
     bool seek(MediaTimeMs positionMs);
 
-    void setVideoSink(IVideoSink* sink) { videoSink_ = sink; }
-    void setAudioSink(IAudioSink* sink) { audioSink_ = sink; }
-    void setSubtitleSink(ISubtitleSink* sink) { subtitleSink_ = sink; }
-    void setStateCallback(Player::StateCallback cb) { stateCallback_ = std::move(cb); }
-    void setErrorCallback(Player::ErrorCallback cb) { errorCallback_ = std::move(cb); }
-    void setFinishedCallback(Player::FinishedCallback cb) { finishedCallback_ = std::move(cb); }
+    // Handlers are configured only while Idle. Calls during playback are ignored,
+    // preventing concurrent replacement of callbacks or non-owning sink pointers.
+    void setVideoSink(IVideoSink* sink);
+    void setAudioSink(IAudioSink* sink);
+    void setSubtitleSink(ISubtitleSink* sink);
+    void setStateCallback(Player::StateCallback cb);
+    void setErrorCallback(Player::ErrorCallback cb);
+    void setFinishedCallback(Player::FinishedCallback cb);
     void setVolume(float volume);
     void setSpeed(double speed);
-    void setHwAccelEnabled(bool enabled)
-    {
-#if FFPLAYER_ENABLE_HWACCEL
-        hwAccelEnabled_ = enabled;
-#else
-        (void)enabled;
-#endif
-    }
+    // Decoder selection happens in open(); calls after open() apply to the next open().
+    void setHwAccelEnabled(bool enabled);
     bool hwAccelEnabled() const { return hwAccelEnabled_.load(); }
     bool videoHwAccelActive() const { return videoDecoder_.hwAccelActive(); }
 
@@ -63,6 +59,8 @@ public:
     MediaTimeMs duration() const { return durationMs_; }
     std::vector<TrackInfo> audioTracks() const { return demuxer_.audioTracks(); }
     std::vector<TrackInfo> subtitleTracks() const { return demuxer_.subtitleTracks(); }
+    int selectedAudioTrack() const { return demuxer_.audioStream(); }
+    int selectedSubtitleTrack() const { return demuxer_.subtitleStream(); }
     bool selectAudioTrack(int streamIndex);
     bool selectSubtitleTrack(int streamIndex);
 
@@ -91,6 +89,7 @@ private:
                     std::uint64_t epoch);
     void presentVideoFrame(AVFrame* frame, MediaTimeMs pts, std::uint64_t epoch);
     bool handleVideoFrame(AVFrame* frame, std::uint64_t epoch);
+    bool decodePausedVideoPreview(MediaTimeMs targetMs, std::uint64_t epoch);
     void notifyStreamFinished(std::uint64_t epoch);
     int expectedEofWorkers() const;
     MediaTimeMs masterClockMs() const;
@@ -99,10 +98,15 @@ private:
     void wakeQueues();
     void beginEofDrain();
     void endEofDrain();
+    bool switchVideoDecoder(bool enableHwAccel, MediaTimeMs positionMs);
 
     mutable std::mutex mutex_;
+    // Serializes public control operations. Recursive because open()/track
+    // selection reuse close()/seek()/play() internally.
+    mutable std::recursive_mutex controlMutex_;
     mutable std::mutex demuxMutex_;
     std::mutex videoCodecMutex_;
+    std::mutex videoPresentationMutex_;
     std::mutex audioCodecMutex_;
     std::mutex subtitleCodecMutex_;
     std::mutex resamplerMutex_;
@@ -119,6 +123,7 @@ private:
     int scalerSrcW_ = 0;
     int scalerSrcH_ = 0;
     int scalerSrcFormat_ = -1;
+    int scalerDstFormat_ = -1;
     int resamplerSrcRate_ = 0;
     int resamplerSrcFormat_ = -1;
     std::uint64_t resamplerSrcLayout_ = 0;
@@ -132,9 +137,9 @@ private:
     std::mutex playbackMutex_;
     std::condition_variable playbackCv_;
     std::atomic_bool videoCatchUp_{false};
-    PacketQueue<AVPacket*> videoPackets_{128};
-    PacketQueue<AVPacket*> audioPackets_{128};
-    PacketQueue<AVPacket*> subtitlePackets_{64};
+    PacketQueue<AVPacket*> videoPackets_{128, 32 * 1024 * 1024};
+    PacketQueue<AVPacket*> audioPackets_{128, 8 * 1024 * 1024};
+    PacketQueue<AVPacket*> subtitlePackets_{64, 4 * 1024 * 1024};
     std::thread demuxThread_;
     std::thread videoThread_;
     std::thread audioThread_;
@@ -156,6 +161,8 @@ private:
     std::atomic<double> speed_{1.0};
     std::atomic<MediaTimeMs> audioClockMs_{0};
     std::atomic<MediaTimeMs> videoClockMs_{0};
+    std::atomic<MediaTimeMs> audioSeekTargetMs_{-1};
+    std::atomic<MediaTimeMs> videoSeekTargetMs_{-1};
     std::atomic<int> eofWorkers_{0};
     std::atomic_bool finishedNotified_{false};
     std::atomic_bool hwAccelEnabled_{FFPLAYER_ENABLE_HWACCEL != 0};

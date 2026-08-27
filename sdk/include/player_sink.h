@@ -8,6 +8,10 @@ class IVideoSink {
 public:
     virtual ~IVideoSink() = default;
     virtual void onVideoFrame(const VideoFrame& frame) = 0;
+    virtual VideoPixelFormat preferredSoftwarePixelFormat() const
+    {
+        return VideoPixelFormat::Yuv420P;
+    }
     // Phase-2: return true if the host can present HwVideoFrame without CPU copy.
     virtual bool supportsHwVideo() const { return false; }
     virtual void onHwVideoFrame(const HwVideoFrame& frame) { (void)frame; }
@@ -18,6 +22,7 @@ public:
     virtual ~IAudioSink() = default;
     virtual bool onAudioChunk(const AudioChunk& chunk) = 0;
     virtual MediaTimeMs bufferedDurationMs() const { return 0; }
+    virtual void setPaused(bool paused) { (void)paused; }
     virtual void flush() {}
 };
 
@@ -31,6 +36,11 @@ public:
     virtual void onSubtitleImage(const SubtitleImage& image)
     {
         (void)image;
+    }
+    // A bitmap subtitle cue can contain multiple positioned rectangles.
+    virtual void onSubtitleImages(const std::vector<SubtitleImage>& images)
+    {
+        for (const auto& image : images) onSubtitleImage(image);
     }
     virtual void onSubtitleClear() = 0;
 };

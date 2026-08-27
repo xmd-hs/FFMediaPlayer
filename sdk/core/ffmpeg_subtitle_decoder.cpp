@@ -172,9 +172,8 @@ bool FfmpegSubtitleDecoder::decode(AVPacket *packet, DecodedSubtitle &out)
         if (duration <= 0) duration = 3000;
         end = start + duration;
     }
-
-    out.image.startMs = start;
-    out.image.endMs = end;
+    out.startMs = start;
+    out.endMs = end;
 
     for (unsigned int index = 0; index < subtitle.num_rects; ++index) {
         const AVSubtitleRect *rect = subtitle.rects[index];
@@ -185,11 +184,7 @@ bool FfmpegSubtitleDecoder::decode(AVPacket *packet, DecodedSubtitle &out)
             if (convertBitmapRect(rect, image)) {
                 image.startMs = start;
                 image.endMs = end;
-                // Keep the largest bitmap if multiple rects exist.
-                if (!out.hasImage || image.width * image.height > out.image.width * out.image.height) {
-                    out.image = std::move(image);
-                    out.hasImage = true;
-                }
+                out.images.push_back(std::move(image));
             }
             continue;
         }
@@ -204,7 +199,7 @@ bool FfmpegSubtitleDecoder::decode(AVPacket *packet, DecodedSubtitle &out)
     }
 
     avsubtitle_free(&subtitle);
-    return out.hasText || out.hasImage;
+    return out.hasText || !out.images.empty();
 }
 
 } // namespace ffplayer

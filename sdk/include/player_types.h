@@ -20,11 +20,17 @@ enum class PlaybackState {
     Error
 };
 
+enum class VideoPixelFormat {
+    Yuv420P,
+    Bgra32
+};
+
 struct VideoFrame {
     const std::uint8_t* data[3]{};
     int linesize[3]{};
     int width = 0;
     int height = 0;
+    VideoPixelFormat format = VideoPixelFormat::Yuv420P;
     MediaTimeMs ptsMs = 0;
 };
 

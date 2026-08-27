@@ -11,10 +11,8 @@ void PlayerSession::subtitleLoop()
         AVPacket* packet = nullptr;
         if (!subtitlePackets_.pop(packet)) break;
         if (!packet) {
-            if (subtitleSink_ && epochIsCurrent(seekEpoch_.load()) &&
-                demuxAtEof_.load(std::memory_order_acquire)) {
-                subtitleSink_->onSubtitleClear();
-            }
+            // The last cue remains visible until its advertised end time. It is
+            // cleared by close(), seek(), or an explicit subtitle-track change.
             continue;
         }
         const std::uint64_t epoch = seekEpoch_.load();
@@ -25,8 +23,8 @@ void PlayerSession::subtitleLoop()
             ok = subtitleDecoder_.decode(packet, decoded);
         }
         if (ok && epochIsCurrent(epoch) && subtitleSink_) {
-            const MediaTimeMs startMs = decoded.image.startMs;
-            const MediaTimeMs endMs = decoded.image.endMs;
+            const MediaTimeMs startMs = decoded.startMs;
+            const MediaTimeMs endMs = decoded.endMs;
             MediaTimeMs now = 0;
             while (!stopRequested_ && epochIsCurrent(epoch) && startMs > 0) {
                 waitWhilePaused();
@@ -39,10 +37,10 @@ void PlayerSession::subtitleLoop()
                 now = masterClockMs();
                 if (!(endMs > 0 && now > endMs)) {
                     if (decoded.hasText) {
-                        subtitleSink_->onSubtitle(decoded.text, decoded.image.startMs, decoded.image.endMs);
+                        subtitleSink_->onSubtitle(decoded.text, startMs, endMs);
                     }
-                    if (decoded.hasImage) {
-                        subtitleSink_->onSubtitleImage(decoded.image);
+                    if (!decoded.images.empty()) {
+                        subtitleSink_->onSubtitleImages(decoded.images);
                     }
                 }
             }

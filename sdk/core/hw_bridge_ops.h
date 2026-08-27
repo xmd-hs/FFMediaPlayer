@@ -3,6 +3,7 @@
 #include "../include/player_types.h"
 
 struct AVFrame;
+struct AVCodecContext;
 
 namespace ffplayer {
 namespace detail {
@@ -14,6 +15,8 @@ struct HwBridgeOps {
     bool (*canPresent)(AVFrame* frame);
     // Preferred FFmpeg hwdevice type, or AV_HWDEVICE_TYPE_NONE (-1 style via int).
     int (*preferredDeviceType)();
+    // Optional platform hook to configure decoder-owned hardware frame pools.
+    bool (*configureFrames)(AVCodecContext* codec, int pixelFormat);
 };
 
 const HwBridgeOps* hwBridgeOps();

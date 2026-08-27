@@ -1,2 +1,54 @@
 @PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+# FFmpeg is resolved on the consuming machine so the installed SDK stays
+# relocatable. Set FFPLAYER_FFMPEG_ROOT (or FFMPEG_ROOT) when needed.
+if (NOT TARGET ffplayer::ffmpeg)
+    set(_ffplayer_ffmpeg_root "${FFPLAYER_FFMPEG_ROOT}")
+    if (NOT _ffplayer_ffmpeg_root AND DEFINED ENV{FFMPEG_ROOT})
+        set(_ffplayer_ffmpeg_root "$ENV{FFMPEG_ROOT}")
+    endif()
+    find_package(PkgConfig QUIET)
+    if (PkgConfig_FOUND AND NOT _ffplayer_ffmpeg_root)
+        pkg_check_modules(FFPLAYER_FFMPEG QUIET IMPORTED_TARGET
+            libavformat libavcodec libavutil libswresample libswscale libavfilter)
+    endif()
+    add_library(ffplayer::ffmpeg INTERFACE IMPORTED)
+    if (TARGET PkgConfig::FFPLAYER_FFMPEG)
+        set_property(TARGET ffplayer::ffmpeg PROPERTY
+            INTERFACE_LINK_LIBRARIES PkgConfig::FFPLAYER_FFMPEG)
+    else()
+        if (WIN32)
+            set(_ffplayer_ffmpeg_lib_suffixes lib/win64 lib)
+        elseif(APPLE)
+            set(_ffplayer_ffmpeg_lib_suffixes lib/macOS lib)
+        else()
+            set(_ffplayer_ffmpeg_lib_suffixes lib/linux64 lib)
+        endif()
+        find_path(_ffplayer_ffmpeg_include_dir libavformat/avformat.h
+            HINTS "${_ffplayer_ffmpeg_root}" ENV FFMPEG_ROOT PATH_SUFFIXES include)
+        foreach(_ffplayer_component avformat avcodec avutil swresample swscale avfilter)
+            string(TOUPPER "${_ffplayer_component}" _ffplayer_component_upper)
+            find_library(_ffplayer_${_ffplayer_component_upper}_library
+                NAMES ${_ffplayer_component}
+                HINTS "${_ffplayer_ffmpeg_root}" ENV FFMPEG_ROOT
+                PATH_SUFFIXES ${_ffplayer_ffmpeg_lib_suffixes})
+            list(APPEND _ffplayer_ffmpeg_libraries
+                "${_ffplayer_${_ffplayer_component_upper}_library}")
+        endforeach()
+        if (NOT _ffplayer_ffmpeg_include_dir OR
+            _ffplayer_ffmpeg_libraries MATCHES "NOTFOUND")
+            set(ffplayer_sdk_FOUND FALSE)
+            set(ffplayer_sdk_NOT_FOUND_MESSAGE
+                "ffplayer_sdk requires FFmpeg development files. Set FFPLAYER_FFMPEG_ROOT or FFMPEG_ROOT.")
+            return()
+        endif()
+        set_property(TARGET ffplayer::ffmpeg PROPERTY
+            INTERFACE_INCLUDE_DIRECTORIES "${_ffplayer_ffmpeg_include_dir}")
+        set_property(TARGET ffplayer::ffmpeg PROPERTY
+            INTERFACE_LINK_LIBRARIES "${_ffplayer_ffmpeg_libraries}")
+    endif()
+endif()
+
 include("${CMAKE_CURRENT_LIST_DIR}/ffplayer_sdkTargets.cmake")

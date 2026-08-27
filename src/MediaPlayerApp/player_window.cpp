@@ -6,17 +6,85 @@
 #include "adapters/d3d11_video_view.h"
 #endif
 #include <QComboBox>
+#include <QCheckBox>
 #include <QFileDialog>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QMouseEvent>
 #include <QPushButton>
 #include <QSizePolicy>
 #include <QSlider>
+#include <QStyle>
 #include <QStackedLayout>
 #include <QVBoxLayout>
 #include <QMetaObject>
+#include <QSignalBlocker>
 #include <algorithm>
 #include <climits>
+
+namespace {
+
+QString trackLabel(const ffplayer::TrackInfo& track, const QString& fallback)
+{
+    QStringList parts;
+    if (!track.language.empty()) parts << QString::fromUtf8(track.language.c_str()).toUpper();
+    if (!track.title.empty()) parts << QString::fromUtf8(track.title.c_str());
+    if (!track.codec.empty()) parts << QString::fromUtf8(track.codec.c_str()).toUpper();
+    return parts.isEmpty() ? fallback : parts.join(QStringLiteral(" · "));
+}
+
+class SeekSlider final : public QSlider {
+public:
+    explicit SeekSlider(Qt::Orientation orientation, QWidget* parent = nullptr)
+        : QSlider(orientation, parent)
+    {
+    }
+
+protected:
+    void mousePressEvent(QMouseEvent* event) override
+    {
+        if (event->button() != Qt::LeftButton) {
+            QSlider::mousePressEvent(event);
+            return;
+        }
+        setSliderDown(true);
+        setValue(valueFromPosition(event->pos()));
+        event->accept();
+    }
+
+    void mouseMoveEvent(QMouseEvent* event) override
+    {
+        if (!isSliderDown()) {
+            QSlider::mouseMoveEvent(event);
+            return;
+        }
+        setValue(valueFromPosition(event->pos()));
+        event->accept();
+    }
+
+    void mouseReleaseEvent(QMouseEvent* event) override
+    {
+        if (event->button() != Qt::LeftButton || !isSliderDown()) {
+            QSlider::mouseReleaseEvent(event);
+            return;
+        }
+        setValue(valueFromPosition(event->pos()));
+        setSliderDown(false);
+        emit sliderReleased();
+        event->accept();
+    }
+
+private:
+    int valueFromPosition(const QPoint& position) const
+    {
+        const int span = orientation() == Qt::Horizontal ? width() : height();
+        const int coordinate = orientation() == Qt::Horizontal ? position.x() : position.y();
+        return QStyle::sliderValueFromPosition(minimum(), maximum(), coordinate, span,
+                                               invertedAppearance());
+    }
+};
+
+} // namespace
 
 PlayerWindow::PlayerWindow(QWidget *parent) : QMainWindow(parent)
 {
@@ -50,7 +118,7 @@ PlayerWindow::PlayerWindow(QWidget *parent) : QMainWindow(parent)
                 status_->setText(QStringLiteral("就绪"));
                 break;
             }
-        }, Qt::QueuedConnection);
+        }, Qt::AutoConnection);
     });
     player_.setErrorCallback([this](const std::string &message) {
         const QString text = QString::fromUtf8(message.c_str());
@@ -104,6 +172,7 @@ PlayerWindow::PlayerWindow(QWidget *parent) : QMainWindow(parent)
     d3dHost_->setMinimumSize(640, 360);
     videoStack->addWidget(d3dHost_);
     videoSink_.setD3d11Host(d3dHost_);
+    d3dHost_->hide();
 #endif
     videoView_ = new QLabel(QStringLiteral("打开文件开始播放"), videoHost);
     videoView_->setAlignment(Qt::AlignCenter);
@@ -120,14 +189,14 @@ PlayerWindow::PlayerWindow(QWidget *parent) : QMainWindow(parent)
     subtitleLabel_->setVisible(false);
     subtitleLabel_->setStyleSheet(
         "QLabel{background:transparent;color:#f5f5f5;font-size:20px;font-weight:600;"
-        "padding:18px 28px 28px 28px;text-shadow:0 1px 2px #000;}");
+        "padding:18px 28px 28px 28px;}");
     videoStack->addWidget(videoView_);
     videoStack->addWidget(subtitleLabel_);
     videoSink_.setView(videoView_);
     subtitleSink_.setLabel(subtitleLabel_);
     content->addWidget(videoHost, 1);
     layout->addLayout(content, 1);
-    progress_ = new QSlider(Qt::Horizontal, root);
+    progress_ = new SeekSlider(Qt::Horizontal, root);
     progress_->setRange(0, 0);
     layout->addWidget(progress_);
 
@@ -143,6 +212,14 @@ PlayerWindow::PlayerWindow(QWidget *parent) : QMainWindow(parent)
     speedBox_->addItem(QStringLiteral("1.5x"), 1.5);
     speedBox_->addItem(QStringLiteral("2.0x"), 2.0);
     speedBox_->setCurrentIndex(2);
+    hwAccelBox_ = new QCheckBox(QStringLiteral("硬件解码"), root);
+    hwAccelBox_->setChecked(player_.hwAccelEnabled());
+    audioTrackBox_ = new QComboBox(root);
+    audioTrackBox_->setMinimumContentsLength(8);
+    audioTrackBox_->setEnabled(false);
+    subtitleTrackBox_ = new QComboBox(root);
+    subtitleTrackBox_->setMinimumContentsLength(8);
+    subtitleTrackBox_->setEnabled(false);
     volume_ = new QSlider(Qt::Horizontal, root);
     volume_->setRange(0, 100);
     volume_->setValue(100);
@@ -154,6 +231,11 @@ PlayerWindow::PlayerWindow(QWidget *parent) : QMainWindow(parent)
     controls->addStretch();
     controls->addWidget(new QLabel(QStringLiteral("倍速"), root));
     controls->addWidget(speedBox_);
+    controls->addWidget(hwAccelBox_);
+    controls->addWidget(new QLabel(QStringLiteral("音轨"), root));
+    controls->addWidget(audioTrackBox_);
+    controls->addWidget(new QLabel(QStringLiteral("字幕"), root));
+    controls->addWidget(subtitleTrackBox_);
     controls->addWidget(new QLabel(QStringLiteral("音量"), root));
     controls->addWidget(volume_);
     layout->addLayout(controls);
@@ -162,7 +244,11 @@ PlayerWindow::PlayerWindow(QWidget *parent) : QMainWindow(parent)
     connect(openButton, &QPushButton::clicked, this, &PlayerWindow::openFile);
     connect(playButton_, &QPushButton::clicked, this, &PlayerWindow::togglePlayback);
     connect(progress_, &QSlider::sliderReleased, this, [this] {
-        player_.seek(progress_->value());
+        if (!player_.seek(progress_->value())) {
+            progress_->setValue(static_cast<int>(std::min<ffplayer::MediaTimeMs>(
+                player_.position(), INT_MAX)));
+            status_->setText(QStringLiteral("跳转失败"));
+        }
     });
     timer_.setInterval(250);
     connect(&timer_, &QTimer::timeout, this, [this] {
@@ -183,6 +269,33 @@ PlayerWindow::PlayerWindow(QWidget *parent) : QMainWindow(parent)
         const double speed = speedBox_->itemData(index).toDouble();
         if (speed > 0.0) player_.setSpeed(speed);
     });
+    connect(hwAccelBox_, &QCheckBox::toggled, this, [this](bool enabled) {
+        player_.setHwAccelEnabled(enabled);
+        const bool active = player_.videoHwAccelActive();
+        status_->setText(active ? QStringLiteral("硬解零拷贝") : QStringLiteral("软解"));
+#ifdef Q_OS_WIN
+        if (d3dHost_) d3dHost_->setVisible(active);
+        if (videoView_) videoView_->setVisible(!active);
+#endif
+    });
+    connect(audioTrackBox_, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [this](int index) {
+        if (index < 0) return;
+        const int stream = audioTrackBox_->itemData(index).toInt();
+        if (!player_.selectAudioTrack(stream)) {
+            status_->setText(QStringLiteral("音轨切换失败"));
+            refreshTrackControls();
+        }
+    });
+    connect(subtitleTrackBox_, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [this](int index) {
+        if (index < 0) return;
+        const int stream = subtitleTrackBox_->itemData(index).toInt();
+        if (!player_.selectSubtitleTrack(stream)) {
+            status_->setText(QStringLiteral("字幕切换失败"));
+            refreshTrackControls();
+        }
+    });
 }
 
 PlayerWindow::~PlayerWindow()
@@ -202,7 +315,8 @@ void PlayerWindow::openFile()
         status_->setText(QStringLiteral("警告: 音频设备不可用，将仅尝试视频"));
     }
 
-    progress_->setRange(0, static_cast<int>(player_.duration()));
+    progress_->setRange(0, static_cast<int>(std::min<ffplayer::MediaTimeMs>(
+        player_.duration(), INT_MAX)));
     if (player_.videoHwAccelActive()) {
         status_->setText(QStringLiteral("硬解零拷贝"));
         videoView_->clear();
@@ -210,10 +324,19 @@ void PlayerWindow::openFile()
         if (metalHost_) metalHost_->clearFrame();
 #endif
 #ifdef Q_OS_WIN
-        if (d3dHost_) d3dHost_->clearFrame();
+        if (d3dHost_) {
+            d3dHost_->show();
+            d3dHost_->raise();
+            d3dHost_->clearFrame();
+        }
 #endif
     } else {
         status_->setText(QStringLiteral("软解"));
+#ifdef Q_OS_WIN
+        if (d3dHost_) d3dHost_->hide();
+#endif
+        videoView_->show();
+        videoView_->raise();
         videoView_->setText(path);
     }
     if (subtitleLabel_) {
@@ -222,7 +345,39 @@ void PlayerWindow::openFile()
     }
     player_.setSpeed(speedBox_->currentData().toDouble());
     player_.setVolume(volume_->value() / 100.0f);
+    refreshTrackControls();
     player_.play();
+}
+
+void PlayerWindow::refreshTrackControls()
+{
+    const QSignalBlocker audioBlocker(audioTrackBox_);
+    const QSignalBlocker subtitleBlocker(subtitleTrackBox_);
+
+    audioTrackBox_->clear();
+    const auto audioTracks = player_.audioTracks();
+    for (std::size_t i = 0; i < audioTracks.size(); ++i) {
+        const auto& track = audioTracks[i];
+        audioTrackBox_->addItem(
+            trackLabel(track, QStringLiteral("音轨 %1").arg(i + 1)), track.streamIndex);
+    }
+    const int selectedAudio = player_.selectedAudioTrack();
+    const int audioIndex = audioTrackBox_->findData(selectedAudio);
+    if (audioIndex >= 0) audioTrackBox_->setCurrentIndex(audioIndex);
+    audioTrackBox_->setEnabled(audioTrackBox_->count() > 1);
+
+    subtitleTrackBox_->clear();
+    subtitleTrackBox_->addItem(QStringLiteral("关闭"), -1);
+    const auto subtitleTracks = player_.subtitleTracks();
+    for (std::size_t i = 0; i < subtitleTracks.size(); ++i) {
+        const auto& track = subtitleTracks[i];
+        subtitleTrackBox_->addItem(
+            trackLabel(track, QStringLiteral("字幕 %1").arg(i + 1)), track.streamIndex);
+    }
+    const int selectedSubtitle = player_.selectedSubtitleTrack();
+    const int subtitleIndex = subtitleTrackBox_->findData(selectedSubtitle);
+    subtitleTrackBox_->setCurrentIndex(subtitleIndex >= 0 ? subtitleIndex : 0);
+    subtitleTrackBox_->setEnabled(subtitleTrackBox_->count() > 1);
 }
 
 void PlayerWindow::togglePlayback()

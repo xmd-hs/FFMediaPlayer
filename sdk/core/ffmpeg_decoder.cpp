@@ -49,7 +49,13 @@ enum AVPixelFormat getHwFormat(AVCodecContext* ctx, const enum AVPixelFormat* pi
     const auto* self = static_cast<const FfmpegDecoder*>(ctx->opaque);
     const auto target = self ? static_cast<AVPixelFormat>(self->hwPixelFormat()) : AV_PIX_FMT_NONE;
     for (const enum AVPixelFormat* p = pixFmts; *p != AV_PIX_FMT_NONE; ++p) {
-        if (*p == target) return *p;
+        if (*p != target) continue;
+        const detail::HwBridgeOps* ops = detail::hwBridgeOps();
+        if (ops && ops->configureFrames &&
+            !ops->configureFrames(ctx, static_cast<int>(target))) {
+            return AV_PIX_FMT_NONE;
+        }
+        return *p;
     }
     return AV_PIX_FMT_NONE;
 }

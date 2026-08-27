@@ -11,9 +11,10 @@ namespace ffplayer {
 
 struct DecodedSubtitle {
     std::string text;
-    SubtitleImage image;
+    std::vector<SubtitleImage> images;
+    MediaTimeMs startMs = 0;
+    MediaTimeMs endMs = 0;
     bool hasText = false;
-    bool hasImage = false;
 };
 
 class FfmpegSubtitleDecoder {

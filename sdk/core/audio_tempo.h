@@ -6,6 +6,7 @@
 
 struct AVFilterGraph;
 struct AVFilterContext;
+struct AVFrame;
 
 namespace ffplayer {
 
@@ -25,6 +26,8 @@ public:
     // in/out are interleaved S16 PCM. Returns false on failure.
     bool process(const std::int16_t* input, int inputFrames,
                  std::vector<std::int16_t>& outputInterleaved);
+    // Signals EOF to atempo and returns its delayed tail samples.
+    bool drain(std::vector<std::int16_t>& outputInterleaved);
 
     double tempo() const { return tempo_; }
     int sampleRate() const { return sampleRate_; }
@@ -33,10 +36,13 @@ public:
 
 private:
     bool rebuild(double tempo);
+    bool collectOutput(std::vector<std::int16_t>& outputInterleaved);
 
     AVFilterGraph* graph_ = nullptr;
     AVFilterContext* src_ = nullptr;
     AVFilterContext* sink_ = nullptr;
+    AVFrame* inputFrame_ = nullptr;
+    AVFrame* outputFrame_ = nullptr;
     int sampleRate_ = 0;
     int channels_ = 0;
     double tempo_ = 1.0;

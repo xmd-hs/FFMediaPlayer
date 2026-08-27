@@ -1,6 +1,7 @@
 #include "player_session.h"
 
 #include <algorithm>
+#include <iostream>
 #include <thread>
 
 extern "C" {
@@ -14,13 +15,129 @@ namespace ffplayer {
 PlayerSession::PlayerSession() = default;
 PlayerSession::~PlayerSession() { close(); }
 
+void PlayerSession::setVideoSink(IVideoSink* sink)
+{
+    std::lock_guard<std::recursive_mutex> controlLock(controlMutex_);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (state_ == PlaybackState::Idle) videoSink_ = sink;
+}
+
+void PlayerSession::setAudioSink(IAudioSink* sink)
+{
+    std::lock_guard<std::recursive_mutex> controlLock(controlMutex_);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (state_ == PlaybackState::Idle) audioSink_ = sink;
+}
+
+void PlayerSession::setSubtitleSink(ISubtitleSink* sink)
+{
+    std::lock_guard<std::recursive_mutex> controlLock(controlMutex_);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (state_ == PlaybackState::Idle) subtitleSink_ = sink;
+}
+
+void PlayerSession::setStateCallback(Player::StateCallback cb)
+{
+    std::lock_guard<std::recursive_mutex> controlLock(controlMutex_);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (state_ == PlaybackState::Idle) stateCallback_ = std::move(cb);
+}
+
+void PlayerSession::setErrorCallback(Player::ErrorCallback cb)
+{
+    std::lock_guard<std::recursive_mutex> controlLock(controlMutex_);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (state_ == PlaybackState::Idle) errorCallback_ = std::move(cb);
+}
+
+void PlayerSession::setFinishedCallback(Player::FinishedCallback cb)
+{
+    std::lock_guard<std::recursive_mutex> controlLock(controlMutex_);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (state_ == PlaybackState::Idle) finishedCallback_ = std::move(cb);
+}
+
+void PlayerSession::setHwAccelEnabled(bool enabled)
+{
+    std::lock_guard<std::recursive_mutex> controlLock(controlMutex_);
+#if FFPLAYER_ENABLE_HWACCEL
+    hwAccelEnabled_ = enabled;
+    const PlaybackState current = state();
+    if (current == PlaybackState::Idle || current == PlaybackState::Opening ||
+        current == PlaybackState::Error || demuxer_.videoStream() < 0) {
+        std::clog << "[ffplayer] hw-switch deferred: preference="
+                  << (enabled ? "hardware" : "software") << '\n';
+        return;
+    }
+    const MediaTimeMs switchPosition = position();
+    std::clog << "[ffplayer] hw-switch requested: target="
+              << (enabled ? "hardware" : "software")
+              << " position_ms=" << switchPosition << '\n';
+    const bool switched = switchVideoDecoder(enabled, switchPosition);
+    std::clog << "[ffplayer] hw-switch " << (switched ? "completed" : "failed")
+              << ": active=" << (videoDecoder_.hwAccelActive() ? "hardware" : "software")
+              << " position_ms=" << position() << '\n';
+#else
+    (void)enabled;
+#endif
+}
+
+bool PlayerSession::switchVideoDecoder(bool enableHwAccel, MediaTimeMs positionMs)
+{
+    const PlaybackState current = state();
+    const bool resumePlayback = current == PlaybackState::Playing ||
+        current == PlaybackState::Buffering;
+    if (resumePlayback) pause();
+
+    AVCodecParameters* parameters = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(demuxMutex_);
+        parameters = demuxer_.videoParameters();
+    }
+    FfmpegDecoder next;
+    const bool opened = parameters && next.open(parameters, enableHwAccel);
+    avcodec_parameters_free(&parameters);
+    if (!opened) {
+        std::clog << "[ffplayer] hw-switch decoder rebuild failed\n";
+        if (resumePlayback) play();
+        return false;
+    }
+    const bool activeHardware = next.hwAccelActive();
+    next.setFramePool(&videoFramePool_);
+
+    // Invalidate in-flight video work before replacing the decoder context.
+    seekEpoch_.fetch_add(1, std::memory_order_acq_rel);
+    videoPackets_.clear(freePacket);
+    {
+        std::lock_guard<std::mutex> lock(videoCodecMutex_);
+        videoDecoder_ = std::move(next);
+    }
+
+    // Re-read from a keyframe at the current media position. seek() restores
+    // the audio/video clocks and resumes playback when it was previously active.
+    if (!seek(positionMs)) {
+        std::clog << "[ffplayer] hw-switch seek recovery failed: position_ms="
+                  << positionMs << '\n';
+        if (resumePlayback) play();
+        return false;
+    }
+    if (resumePlayback) play();
+    std::clog << "[ffplayer] hw-switch decoder rebuilt: requested="
+              << (enableHwAccel ? "hardware" : "software")
+              << " active=" << (activeHardware ? "hardware" : "software")
+              << " resumed=" << (resumePlayback ? 1 : 0) << '\n';
+    return true;
+}
+
 void PlayerSession::setVolume(float volume)
 {
+    std::lock_guard<std::recursive_mutex> controlLock(controlMutex_);
     volume_ = volume < 0.f ? 0.f : volume > 1.f ? 1.f : volume;
 }
 
 void PlayerSession::setSpeed(double speed)
 {
+    std::lock_guard<std::recursive_mutex> controlLock(controlMutex_);
     if (speed <= 0.0) return;
     speed = std::max(0.25, std::min(4.0, speed));
     speed_ = speed;
@@ -46,6 +163,7 @@ void PlayerSession::resetScaler()
     scalerSrcW_ = 0;
     scalerSrcH_ = 0;
     scalerSrcFormat_ = -1;
+    scalerDstFormat_ = -1;
 }
 
 bool PlayerSession::ensureSubtitleThread()
@@ -59,16 +177,20 @@ bool PlayerSession::ensureSubtitleThread()
 
 bool PlayerSession::open(const std::string& url)
 {
+    std::lock_guard<std::recursive_mutex> controlLock(controlMutex_);
     if (url.empty()) return false;
     close();
+    // close() sets this flag; clear it before FFmpeg invokes the I/O interrupt
+    // callback while opening a new network source.
+    stopRequested_ = false;
     setState(PlaybackState::Opening);
+    demuxer_.setInterruptCallback([this] { return stopRequested_.load(std::memory_order_acquire); });
     if (!demuxer_.open(url)) {
         if (errorCallback_) errorCallback_(demuxer_.lastError().empty()
             ? "failed to open media" : demuxer_.lastError());
         setState(PlaybackState::Error);
         return false;
     }
-    stopRequested_ = false;
     demuxAtEof_ = false;
     eofDrainActive_ = false;
     decodeErrorNotified_ = false;
@@ -79,6 +201,8 @@ bool PlayerSession::open(const std::string& url)
     paused_ = true;
     audioClockMs_ = 0;
     videoClockMs_ = 0;
+    audioSeekTargetMs_ = -1;
+    videoSeekTargetMs_ = -1;
     videoCatchUp_ = false;
     videoFramePool_.clear();
     scalerFramePool_.clear();
@@ -135,8 +259,10 @@ bool PlayerSession::open(const std::string& url)
 
 void PlayerSession::close()
 {
+    std::lock_guard<std::recursive_mutex> controlLock(controlMutex_);
     stopRequested_ = true;
     paused_ = false;
+    if (audioSink_) audioSink_->setPaused(false);
     wakeQueues();
     videoPackets_.stop(freePacket);
     audioPackets_.stop(freePacket);
@@ -174,14 +300,16 @@ void PlayerSession::close()
 
 void PlayerSession::play()
 {
+    std::lock_guard<std::recursive_mutex> controlLock(controlMutex_);
     const PlaybackState current = state();
     if (current == PlaybackState::Idle || current == PlaybackState::Error) return;
 
-    if (current == PlaybackState::Ended || demuxAtEof_.load()) {
+    if (current == PlaybackState::Ended) {
         if (!seek(0)) return;
     }
 
     paused_ = false;
+    if (audioSink_) audioSink_->setPaused(false);
     wakeQueues();
     clock_.start();
     setState(PlaybackState::Playing);
@@ -189,14 +317,20 @@ void PlayerSession::play()
 
 void PlayerSession::pause()
 {
+    std::lock_guard<std::recursive_mutex> controlLock(controlMutex_);
+    const PlaybackState current = state();
+    if (current != PlaybackState::Playing && current != PlaybackState::Buffering) return;
+    const MediaTimeMs pausedAt = position();
     paused_ = true;
-    clock_.pause();
+    if (audioSink_) audioSink_->setPaused(true);
+    clock_.reset(pausedAt);
     wakeQueues();
     setState(PlaybackState::Paused);
 }
 
 bool PlayerSession::seek(MediaTimeMs positionMs)
 {
+    std::lock_guard<std::recursive_mutex> controlLock(controlMutex_);
     if (positionMs < 0 || (durationMs_ > 0 && positionMs > durationMs_)) return false;
     const PlaybackState current = state();
     if (current == PlaybackState::Idle || current == PlaybackState::Opening ||
@@ -236,6 +370,8 @@ bool PlayerSession::seek(MediaTimeMs positionMs)
     finishedNotified_ = false;
     eofWorkers_ = 0;
     seekEpoch_.fetch_add(1, std::memory_order_acq_rel);
+    audioSeekTargetMs_ = demuxer_.audioStream() >= 0 ? positionMs : -1;
+    videoSeekTargetMs_ = demuxer_.videoStream() >= 0 ? positionMs : -1;
 
     videoPackets_.clear(freePacket);
     audioPackets_.clear(freePacket);
@@ -259,11 +395,15 @@ bool PlayerSession::seek(MediaTimeMs positionMs)
     videoCatchUp_ = false;
     videoFramePool_.clear();
     scalerFramePool_.clear();
+    const std::uint64_t previewEpoch = seekEpoch_.load(std::memory_order_acquire);
+    if (!wasPlaying) decodePausedVideoPreview(positionMs, previewEpoch);
     paused_ = !wasPlaying;
     if (wasPlaying) {
+        if (audioSink_) audioSink_->setPaused(false);
         clock_.start();
         setState(PlaybackState::Playing);
     } else {
+        if (audioSink_) audioSink_->setPaused(true);
         setState(PlaybackState::Paused);
     }
     wakeQueues();
@@ -272,82 +412,103 @@ bool PlayerSession::seek(MediaTimeMs positionMs)
 
 bool PlayerSession::selectAudioTrack(int streamIndex)
 {
+    std::lock_guard<std::recursive_mutex> controlLock(controlMutex_);
     const PlaybackState current = state();
-    if (current == PlaybackState::Playing || current == PlaybackState::Buffering ||
-        current == PlaybackState::Seeking) {
-        return false;
-    }
-    paused_ = true;
-    wakeQueues();
+    if (current == PlaybackState::Idle || current == PlaybackState::Opening ||
+        current == PlaybackState::Seeking || current == PlaybackState::Error) return false;
 
-    std::lock_guard<std::mutex> demuxLock(demuxMutex_);
-    const int previousStream = demuxer_.audioStream();
-    if (!demuxer_.selectAudioTrack(streamIndex)) return false;
+    const bool resumePlayback = current == PlaybackState::Playing ||
+        current == PlaybackState::Buffering;
+    const MediaTimeMs switchPosition = position();
+    if (resumePlayback) pause();
 
-    auto* parameters = demuxer_.audioParameters();
-    FfmpegDecoder next;
-    const bool opened = parameters && next.open(parameters);
-    avcodec_parameters_free(&parameters);
-    if (!opened) {
-        demuxer_.selectAudioTrack(previousStream);
-        return false;
-    }
-
-    seekEpoch_.fetch_add(1, std::memory_order_acq_rel);
-    audioPackets_.clear(freePacket);
-    resetResampler();
-    if (audioSink_) audioSink_->flush();
+    bool switched = false;
     {
-        std::lock_guard<std::mutex> codecLock(audioCodecMutex_);
-        audioDecoder_ = std::move(next);
-        audioDecoder_.setFramePool(nullptr);
+        std::lock_guard<std::mutex> demuxLock(demuxMutex_);
+        const int previousStream = demuxer_.audioStream();
+        if (previousStream == streamIndex) {
+            switched = true;
+        } else if (demuxer_.selectAudioTrack(streamIndex)) {
+            auto* parameters = demuxer_.audioParameters();
+            FfmpegDecoder next;
+            const bool opened = parameters && next.open(parameters, false);
+            avcodec_parameters_free(&parameters);
+            if (!opened) {
+                demuxer_.selectAudioTrack(previousStream);
+            } else {
+                seekEpoch_.fetch_add(1, std::memory_order_acq_rel);
+                audioPackets_.clear(freePacket);
+                resetResampler();
+                if (audioSink_) audioSink_->flush();
+                {
+                    std::lock_guard<std::mutex> codecLock(audioCodecMutex_);
+                    audioDecoder_ = std::move(next);
+                    audioDecoder_.setFramePool(nullptr);
+                }
+                switched = true;
+            }
+        }
     }
-    audioClockMs_ = clock_.position();
-    return true;
+
+    if (switched) switched = seek(switchPosition);
+    if (resumePlayback) play();
+    return switched;
 }
 
 bool PlayerSession::selectSubtitleTrack(int streamIndex)
 {
+    std::lock_guard<std::recursive_mutex> controlLock(controlMutex_);
     const PlaybackState current = state();
-    if (current == PlaybackState::Playing || current == PlaybackState::Buffering ||
-        current == PlaybackState::Seeking) {
-        return false;
-    }
-    paused_ = true;
-    wakeQueues();
+    if (current == PlaybackState::Idle || current == PlaybackState::Opening ||
+        current == PlaybackState::Seeking || current == PlaybackState::Error) return false;
 
-    std::lock_guard<std::mutex> demuxLock(demuxMutex_);
-    const int previousStream = demuxer_.subtitleStream();
-    if (!demuxer_.selectSubtitleTrack(streamIndex)) return false;
-    if (streamIndex == -1) {
-        seekEpoch_.fetch_add(1, std::memory_order_acq_rel);
-        subtitlePump_ = false;
-        std::lock_guard<std::mutex> codecLock(subtitleCodecMutex_);
-        subtitleDecoder_.close();
-        subtitlePackets_.clear(freePacket);
-        subtitlePackets_.tryPush(nullptr);
-        if (subtitleSink_) subtitleSink_->onSubtitleClear();
-        return true;
-    }
+    const bool resumePlayback = current == PlaybackState::Playing ||
+        current == PlaybackState::Buffering;
+    const MediaTimeMs switchPosition = position();
+    if (resumePlayback) pause();
 
-    auto* parameters = demuxer_.subtitleParameters();
-    FfmpegSubtitleDecoder next;
-    const bool opened = parameters && next.open(parameters);
-    avcodec_parameters_free(&parameters);
-    if (!opened) {
-        demuxer_.selectSubtitleTrack(previousStream);
-        return false;
-    }
-
-    seekEpoch_.fetch_add(1, std::memory_order_acq_rel);
+    bool switched = false;
     {
-        std::lock_guard<std::mutex> codecLock(subtitleCodecMutex_);
-        subtitleDecoder_ = std::move(next);
+        std::lock_guard<std::mutex> demuxLock(demuxMutex_);
+        const int previousStream = demuxer_.subtitleStream();
+        if (previousStream == streamIndex) {
+            switched = true;
+        } else if (demuxer_.selectSubtitleTrack(streamIndex)) {
+            if (streamIndex == -1) {
+                seekEpoch_.fetch_add(1, std::memory_order_acq_rel);
+                subtitlePump_ = false;
+                {
+                    std::lock_guard<std::mutex> codecLock(subtitleCodecMutex_);
+                    subtitleDecoder_.close();
+                }
+                subtitlePackets_.clear(freePacket);
+                if (subtitleSink_) subtitleSink_->onSubtitleClear();
+                switched = true;
+            } else {
+                auto* parameters = demuxer_.subtitleParameters();
+                FfmpegSubtitleDecoder next;
+                const bool opened = parameters && next.open(parameters);
+                avcodec_parameters_free(&parameters);
+                if (!opened) {
+                    demuxer_.selectSubtitleTrack(previousStream);
+                } else {
+                    seekEpoch_.fetch_add(1, std::memory_order_acq_rel);
+                    {
+                        std::lock_guard<std::mutex> codecLock(subtitleCodecMutex_);
+                        subtitleDecoder_ = std::move(next);
+                    }
+                    subtitlePackets_.clear(freePacket);
+                    if (subtitleSink_) subtitleSink_->onSubtitleClear();
+                    if (ensureSubtitleThread()) subtitlePump_ = true;
+                    switched = true;
+                }
+            }
+        }
     }
-    subtitlePackets_.clear(freePacket);
-    if (subtitleSink_) subtitleSink_->onSubtitleClear();
-    if (ensureSubtitleThread()) subtitlePump_ = true;
-    return true;
+
+    if (switched) switched = seek(switchPosition);
+    if (resumePlayback) play();
+    return switched;
 }
 
 } // namespace ffplayer

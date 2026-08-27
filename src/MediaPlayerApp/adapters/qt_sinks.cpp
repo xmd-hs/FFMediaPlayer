@@ -13,6 +13,7 @@
 #include <QAudioDeviceInfo>
 #include <QMetaObject>
 #include <QPointer>
+#include <QPainter>
 #include <QMutexLocker>
 #include <QRegularExpression>
 #include <QTimer>
@@ -28,13 +29,19 @@ QtAudioBuffer::QtAudioBuffer(QObject *parent)
 
 qint64 QtAudioBuffer::readData(char *data, qint64 maxSize)
 {
+    if (!data || maxSize <= 0) {
+        return 0;
+    }
     QMutexLocker lock(&mutex_);
     const qint64 count = qMin(maxSize, static_cast<qint64>(buffer_.size()));
     if (count > 0) {
         memcpy(data, buffer_.constData(), static_cast<size_t>(count));
         buffer_.remove(0, static_cast<int>(count));
     }
-    return count;
+    if (count < maxSize) {
+        memset(data + count, 0, static_cast<size_t>(maxSize - count));
+    }
+    return maxSize;
 }
 
 qint64 QtAudioBuffer::writeData(const char *data, qint64 size)
@@ -82,7 +89,7 @@ bool QtVideoSink::supportsHwVideo() const
 #if defined(Q_OS_MAC)
     return metalHost_ != nullptr;
 #elif defined(Q_OS_WIN)
-    return d3dHost_ != nullptr;
+    return d3dHost_ != nullptr && d3dHost_->hardwarePresentationAvailable();
 #else
     return false;
 #endif
@@ -106,13 +113,28 @@ void QtVideoSink::onHwVideoFrame(const ffplayer::HwVideoFrame &frame)
     if (!d3dHost_ || frame.backend != ffplayer::HwVideoBackend::D3D11 || !frame.nativeHandle) {
         return;
     }
-    auto keep = frame.keepAlive;
-    void *tex = frame.nativeHandle;
-    const int slice = frame.subresourceIndex;
+    {
+        QMutexLocker lock(&pendingImageMutex_);
+        pendingHwHandle_ = frame.nativeHandle;
+        pendingHwSlice_ = frame.subresourceIndex;
+        pendingHwKeepAlive_ = frame.keepAlive;
+        if (hwUpdateScheduled_) return;
+        hwUpdateScheduled_ = true;
+    }
     D3d11VideoViewHost *host = d3dHost_;
-    QTimer::singleShot(0, host, [host, keep, tex, slice] {
-        if (!host) return;
-        host->setDecodeTexture(tex, slice, keep);
+    QTimer::singleShot(0, host, [this, host] {
+        void* tex = nullptr;
+        int slice = 0;
+        std::shared_ptr<void> keep;
+        {
+            QMutexLocker lock(&pendingImageMutex_);
+            tex = pendingHwHandle_;
+            slice = pendingHwSlice_;
+            keep = std::move(pendingHwKeepAlive_);
+            pendingHwHandle_ = nullptr;
+            hwUpdateScheduled_ = false;
+        }
+        if (host && tex) host->setDecodeTexture(tex, slice, std::move(keep));
     });
 #else
     (void)frame;
@@ -123,28 +145,56 @@ void QtVideoSink::onVideoFrame(const ffplayer::VideoFrame &frame)
 {
     if (!softView_ || !frame.data[0] || frame.width <= 0 || frame.height <= 0)
         return;
-    QImage image(frame.width, frame.height, QImage::Format_RGB32);
-    for (int y = 0; y < frame.height; ++y) {
-        auto *dst = reinterpret_cast<QRgb *>(image.scanLine(y));
-        const auto *yPlane = frame.data[0] + y * frame.linesize[0];
-        const auto *uPlane = frame.data[1] + (y / 2) * frame.linesize[1];
-        const auto *vPlane = frame.data[2] + (y / 2) * frame.linesize[2];
-        for (int x = 0; x < frame.width; ++x) {
-            const int Y = yPlane[x] - 16;
-            const int U = uPlane[x / 2] - 128;
-            const int V = vPlane[x / 2] - 128;
-            const int r = qBound(0, (298 * Y + 409 * V + 128) / 256, 255);
-            const int g = qBound(0, (298 * Y - 100 * U - 208 * V + 128) / 256, 255);
-            const int b = qBound(0, (298 * Y + 516 * U + 128) / 256, 255);
-            dst[x] = qRgb(r, g, b);
+#ifdef Q_OS_WIN
+    QPointer<QLabel> softView = softView_;
+    QPointer<D3d11VideoViewHost> d3dHost = d3dHost_;
+    QMetaObject::invokeMethod(softView_, [softView, d3dHost] {
+        if (d3dHost) d3dHost->hide();
+        if (softView) {
+            softView->show();
+            softView->raise();
+        }
+    }, Qt::QueuedConnection);
+#endif
+    QImage image;
+    if (frame.format == ffplayer::VideoPixelFormat::Bgra32) {
+        image = QImage(frame.data[0], frame.width, frame.height, frame.linesize[0],
+                       QImage::Format_ARGB32).copy();
+    } else {
+        image = QImage(frame.width, frame.height, QImage::Format_RGB32);
+        for (int y = 0; y < frame.height; ++y) {
+            auto *dst = reinterpret_cast<QRgb *>(image.scanLine(y));
+            const auto *yPlane = frame.data[0] + y * frame.linesize[0];
+            const auto *uPlane = frame.data[1] + (y / 2) * frame.linesize[1];
+            const auto *vPlane = frame.data[2] + (y / 2) * frame.linesize[2];
+            for (int x = 0; x < frame.width; ++x) {
+                const int Y = yPlane[x] - 16;
+                const int U = uPlane[x / 2] - 128;
+                const int V = vPlane[x / 2] - 128;
+                const int r = qBound(0, (298 * Y + 409 * V + 128) / 256, 255);
+                const int g = qBound(0, (298 * Y - 100 * U - 208 * V + 128) / 256, 255);
+                const int b = qBound(0, (298 * Y + 516 * U + 128) / 256, 255);
+                dst[x] = qRgb(r, g, b);
+            }
         }
     }
+    {
+        QMutexLocker lock(&pendingImageMutex_);
+        pendingImage_ = std::move(image);
+        if (imageUpdateScheduled_) return;
+        imageUpdateScheduled_ = true;
+    }
+
     QPointer<QLabel> view = softView_;
-    QMetaObject::invokeMethod(softView_, [view, image] {
-        if (!view) {
-            return;
+    QMetaObject::invokeMethod(softView_, [this, view] {
+        QImage latest;
+        {
+            QMutexLocker lock(&pendingImageMutex_);
+            latest = std::move(pendingImage_);
+            imageUpdateScheduled_ = false;
         }
-        view->setPixmap(QPixmap::fromImage(image).scaled(
+        if (!view || latest.isNull()) return;
+        view->setPixmap(QPixmap::fromImage(latest).scaled(
             view->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
     }, Qt::QueuedConnection);
 }
@@ -177,6 +227,7 @@ QtAudioSink::QtAudioSink()
     sampleRate_ = format.sampleRate();
     channels_ = format.channelCount();
     output_ = new QAudioOutput(device, format);
+    output_->setBufferSize(sampleRate_ * channels_ * 2 / 20); // 50 ms
     output_->setVolume(1.0);
     buffer_ = new QtAudioBuffer(output_);
     output_->start(buffer_);
@@ -220,13 +271,59 @@ void QtAudioSink::setVolume(int percent)
     if (output_) output_->setVolume(qBound(0, percent, 100) / 100.0);
 }
 
+void QtAudioSink::setPaused(bool paused)
+{
+    QPointer<QAudioOutput> output;
+    QPointer<QtAudioBuffer> buffer;
+    {
+        QMutexLocker lock(&mutex_);
+        if (closing_ || !output_ || !buffer_) return;
+        output = output_;
+        buffer = buffer_;
+    }
+
+    const auto updateState = [output, buffer, paused] {
+        if (!output || !buffer) return;
+        if (paused) {
+            if (output->state() == QAudio::ActiveState ||
+                output->state() == QAudio::IdleState) {
+                output->suspend();
+            }
+        } else if (output->state() == QAudio::SuspendedState) {
+            output->resume();
+        } else if (output->state() == QAudio::StoppedState) {
+            output->start(buffer);
+        }
+    };
+    if (QThread::currentThread() == output->thread()) {
+        updateState();
+    } else {
+        QMetaObject::invokeMethod(output, updateState, Qt::QueuedConnection);
+    }
+}
+
 void QtAudioSink::flush()
 {
-    QMutexLocker lock(&mutex_);
-    if (closing_ || !output_ || !buffer_) return;
-    buffer_->clear();
-    output_->stop();
-    output_->start(buffer_);
+    QPointer<QAudioOutput> output;
+    QPointer<QtAudioBuffer> buffer;
+    {
+        QMutexLocker lock(&mutex_);
+        if (closing_ || !output_ || !buffer_) return;
+        output = output_;
+        buffer = buffer_;
+    }
+
+    const auto resetOutput = [output, buffer] {
+        if (!output || !buffer) return;
+        buffer->clear();
+        output->stop();
+        output->start(buffer);
+    };
+    if (QThread::currentThread() == output->thread()) {
+        resetOutput();
+    } else {
+        QMetaObject::invokeMethod(output, resetOutput, Qt::QueuedConnection);
+    }
 }
 
 ffplayer::MediaTimeMs QtAudioSink::bufferedDurationMs() const
@@ -305,6 +402,7 @@ void QtSubtitleSink::showForDuration(const QString &text, const QImage &image, i
             label->setPixmap(QPixmap());
             label->setText(text);
         }
+        label->raise();
         label->setVisible(!text.isEmpty() || !image.isNull());
         if (text.isEmpty() && image.isNull()) return;
         QTimer::singleShot(durationMs, label, [label, token] {
@@ -345,6 +443,60 @@ void QtSubtitleSink::onSubtitleImage(const ffplayer::SubtitleImage &image)
         durationMs = static_cast<int>(std::min<ffplayer::MediaTimeMs>(image.endMs - image.startMs, 15000));
     }
     showForDuration(QString(), qimage, durationMs);
+}
+
+void QtSubtitleSink::onSubtitleImages(const std::vector<ffplayer::SubtitleImage> &images)
+{
+    if (images.empty()) return;
+    if (images.size() == 1) {
+        onSubtitleImage(images.front());
+        return;
+    }
+
+    int left = 0;
+    int top = 0;
+    int right = 0;
+    int bottom = 0;
+    bool hasValidImage = false;
+    for (const auto& image : images) {
+        if (image.width <= 0 || image.height <= 0 ||
+            image.rgba.size() < static_cast<std::size_t>(image.width) * image.height * 4) continue;
+        if (!hasValidImage) {
+            left = image.x;
+            top = image.y;
+            right = image.x + image.width;
+            bottom = image.y + image.height;
+            hasValidImage = true;
+        } else {
+            left = std::min(left, image.x);
+            top = std::min(top, image.y);
+            right = std::max(right, image.x + image.width);
+            bottom = std::max(bottom, image.y + image.height);
+        }
+    }
+    if (!hasValidImage || right <= left || bottom <= top) return;
+
+    QImage composite(right - left, bottom - top, QImage::Format_RGBA8888);
+    composite.fill(Qt::transparent);
+    QPainter painter(&composite);
+    for (const auto& image : images) {
+        if (image.width <= 0 || image.height <= 0 ||
+            image.rgba.size() < static_cast<std::size_t>(image.width) * image.height * 4) continue;
+        QImage rect(image.width, image.height, QImage::Format_RGBA8888);
+        for (int y = 0; y < image.height; ++y) {
+            std::memcpy(rect.scanLine(y),
+                        image.rgba.data() + static_cast<std::size_t>(y) * image.width * 4,
+                        static_cast<std::size_t>(image.width) * 4);
+        }
+        painter.drawImage(image.x - left, image.y - top, rect);
+    }
+    painter.end();
+    int durationMs = 3000;
+    if (images.front().endMs > images.front().startMs) {
+        durationMs = static_cast<int>(std::min<ffplayer::MediaTimeMs>(
+            images.front().endMs - images.front().startMs, 15000));
+    }
+    showForDuration(QString(), composite, durationMs);
 }
 
 void QtSubtitleSink::onSubtitleClear()

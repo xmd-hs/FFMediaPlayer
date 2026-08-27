@@ -22,6 +22,7 @@ if (PkgConfig_FOUND AND NOT FFMPEG_ROOT)
 endif()
 
 set(FFPLAYER_HAS_FFMPEG_LOCAL FALSE)
+set(FFPLAYER_FFMPEG_LIBRARIES PkgConfig::FFMPEG)
 if (NOT TARGET PkgConfig::FFMPEG)
     if (FFMPEG_ROOT)
         set(FFMPEG_INCLUDE_DIR "${FFMPEG_ROOT}/include" CACHE PATH "FFmpeg include directory" FORCE)
@@ -45,11 +46,23 @@ if (NOT TARGET PkgConfig::FFMPEG)
     if (NOT FFMPEG_INCLUDE_DIR OR NOT AVFORMAT_LIBRARY OR NOT AVCODEC_LIBRARY OR NOT AVUTIL_LIBRARY OR NOT SWRESAMPLE_LIBRARY OR NOT SWSCALE_LIBRARY OR NOT AVFILTER_LIBRARY)
         message(FATAL_ERROR "FFmpeg not found. Install FFmpeg development files or set FFMPEG_ROOT.")
     endif()
-    add_library(ffmpeg_local INTERFACE)
-    target_include_directories(ffmpeg_local INTERFACE ${FFMPEG_INCLUDE_DIR})
-    target_link_libraries(ffmpeg_local INTERFACE ${AVFORMAT_LIBRARY} ${AVCODEC_LIBRARY} ${AVUTIL_LIBRARY} ${SWRESAMPLE_LIBRARY} ${SWSCALE_LIBRARY} ${AVFILTER_LIBRARY})
-    add_library(PkgConfig::FFMPEG ALIAS ffmpeg_local)
+    set(FFPLAYER_FFMPEG_LIBRARIES
+        ${AVFORMAT_LIBRARY} ${AVCODEC_LIBRARY} ${AVUTIL_LIBRARY}
+        ${SWRESAMPLE_LIBRARY} ${SWSCALE_LIBRARY} ${AVFILTER_LIBRARY})
     set(FFPLAYER_HAS_FFMPEG_LOCAL TRUE)
+endif()
+
+# Keep FFmpeg as a named dependency. Exporting raw find_library() values would
+# embed this machine's absolute paths in ffplayer_sdkTargets.cmake.
+add_library(ffplayer::ffmpeg INTERFACE IMPORTED GLOBAL)
+if (TARGET PkgConfig::FFMPEG)
+    set_property(TARGET ffplayer::ffmpeg PROPERTY
+        INTERFACE_LINK_LIBRARIES PkgConfig::FFMPEG)
+else()
+    set_property(TARGET ffplayer::ffmpeg PROPERTY
+        INTERFACE_INCLUDE_DIRECTORIES "${FFMPEG_INCLUDE_DIR}")
+    set_property(TARGET ffplayer::ffmpeg PROPERTY
+        INTERFACE_LINK_LIBRARIES "${FFPLAYER_FFMPEG_LIBRARIES}")
 endif()
 
 # ---- Portable engine (no OS graphics APIs) ----
@@ -92,8 +105,14 @@ target_include_directories(ffplayer_sdk PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/include>
     $<INSTALL_INTERFACE:include/ffplayer>)
 target_include_directories(ffplayer_sdk PRIVATE core)
-target_link_libraries(ffplayer_sdk PRIVATE PkgConfig::FFMPEG)
+if (FFPLAYER_HAS_FFMPEG_LOCAL)
+    target_include_directories(ffplayer_sdk PRIVATE ${FFMPEG_INCLUDE_DIR})
+endif()
+target_link_libraries(ffplayer_sdk PRIVATE ffplayer::ffmpeg)
 target_compile_features(ffplayer_sdk PUBLIC cxx_std_17)
+if (MSVC)
+    target_compile_options(ffplayer_sdk PRIVATE /utf-8)
+endif()
 
 if (FFPLAYER_ENABLE_HWACCEL)
     target_compile_definitions(ffplayer_sdk PUBLIC FFPLAYER_ENABLE_HWACCEL=1)
@@ -104,15 +123,9 @@ endif()
 # No Qt / window-system linkage in the SDK target.
 set_target_properties(ffplayer_sdk PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-if (FFPLAYER_HAS_FFMPEG_LOCAL)
-    install(TARGETS ffplayer_sdk ffmpeg_local EXPORT ffplayer_sdkTargets
-        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-        INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-else()
-    install(TARGETS ffplayer_sdk EXPORT ffplayer_sdkTargets
-        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-        INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-endif()
+install(TARGETS ffplayer_sdk EXPORT ffplayer_sdkTargets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ffplayer)
 install(EXPORT ffplayer_sdkTargets FILE ffplayer_sdkTargets.cmake
     NAMESPACE ffplayer:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ffplayer_sdk)

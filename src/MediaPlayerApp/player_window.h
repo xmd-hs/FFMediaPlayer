@@ -10,6 +10,7 @@ class QLabel;
 class QPushButton;
 class QSlider;
 class QComboBox;
+class QCheckBox;
 class MetalVideoViewHost;
 class D3d11VideoViewHost;
 
@@ -21,6 +22,7 @@ public:
 private:
     void openFile();
     void togglePlayback();
+    void refreshTrackControls();
 
     QLabel *videoView_ = nullptr;
 #if defined(Q_OS_MAC)
@@ -35,6 +37,9 @@ private:
     QSlider *progress_ = nullptr;
     QSlider *volume_ = nullptr;
     QComboBox *speedBox_ = nullptr;
+    QComboBox *audioTrackBox_ = nullptr;
+    QComboBox *subtitleTrackBox_ = nullptr;
+    QCheckBox *hwAccelBox_ = nullptr;
     QTimer timer_;
     ffplayer::Player player_;
     QtVideoSink videoSink_;

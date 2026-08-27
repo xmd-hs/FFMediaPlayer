@@ -3,6 +3,7 @@
 #include <string>
 
 struct AVCodecContext;
+struct AVCodec;
 struct AVCodecParameters;
 struct AVPacket;
 struct AVFrame;

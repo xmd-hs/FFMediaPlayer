@@ -32,6 +32,8 @@ void Player::pause() { impl_->session.pause(); }
 bool Player::seek(MediaTimeMs position) { return impl_->session.seek(position); }
 std::vector<TrackInfo> Player::audioTracks() const { return impl_->session.audioTracks(); }
 std::vector<TrackInfo> Player::subtitleTracks() const { return impl_->session.subtitleTracks(); }
+int Player::selectedAudioTrack() const { return impl_->session.selectedAudioTrack(); }
+int Player::selectedSubtitleTrack() const { return impl_->session.selectedSubtitleTrack(); }
 bool Player::selectAudioTrack(int streamIndex) { return impl_->session.selectAudioTrack(streamIndex); }
 bool Player::selectSubtitleTrack(int streamIndex) { return impl_->session.selectSubtitleTrack(streamIndex); }
 PlaybackState Player::state() const { return impl_->session.state(); }

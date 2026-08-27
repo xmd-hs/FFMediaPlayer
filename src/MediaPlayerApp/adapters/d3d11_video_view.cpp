@@ -11,13 +11,22 @@
 
 #include <QResizeEvent>
 #include <QShowEvent>
+#include <QPaintEvent>
+#include <QPaintEngine>
 #include <QTimer>
+#include <QCoreApplication>
+#include <QDateTime>
+#include <QDebug>
+#include <QFile>
+#include <QTextStream>
 #include <mutex>
 #include <cstring>
 #include <algorithm>
+#include <atomic>
 
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d11_4.h>
 #include <dxgi.h>
 #include <d3dcompiler.h>
 
@@ -26,6 +35,26 @@
 #pragma comment(lib, "d3dcompiler.lib")
 
 namespace {
+
+void writeHwLog(const QString& message)
+{
+    static std::mutex logMutex;
+    std::lock_guard<std::mutex> lock(logMutex);
+    const QString line = QStringLiteral("[%1] %2")
+        .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss.zzz")),
+             message);
+    qInfo().noquote() << line;
+    QFile file(QCoreApplication::applicationDirPath() + QStringLiteral("/ffplayer_hw.log"));
+    if (file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
+        QTextStream stream(&file);
+        stream << line << '\n';
+    }
+}
+
+QString hexValue(unsigned long value)
+{
+    return QStringLiteral("0x%1").arg(value, 0, 16);
+}
 
 const char* kShaderHlsl = R"(
 struct VSOut {
@@ -82,10 +111,21 @@ struct D3d11VideoViewHost::Impl {
     ID3D11PixelShader* psNv12 = nullptr;
     ID3D11PixelShader* psBgra = nullptr;
     ID3D11SamplerState* sampler = nullptr;
+    ID3D11RasterizerState* rasterizer = nullptr;
+    ID3D11ShaderResourceView* sampleSrv0 = nullptr;
+    ID3D11ShaderResourceView* sampleSrv1 = nullptr;
+    ID3D11Texture2D* srvTexture = nullptr;
+    UINT srvSlice = 0;
 
     UINT width = 0;
     UINT height = 0;
     bool shadersReady = false;
+    std::atomic_bool presentationAvailable{true};
+    std::uint64_t receivedFrames = 0;
+    std::uint64_t presentedFrames = 0;
+    std::uint64_t failedFrames = 0;
+    bool textureDescriptorLogged = false;
+    bool zeroCopyLogged = false;
 
     ID3D11Texture2D* pendingTex = nullptr;
     int pendingSlice = 0;
@@ -101,6 +141,10 @@ struct D3d11VideoViewHost::Impl {
         safeRelease(rtv);
         safeRelease(swapChain);
         safeRelease(sampler);
+        safeRelease(rasterizer);
+        safeRelease(sampleSrv1);
+        safeRelease(sampleSrv0);
+        safeRelease(srvTexture);
         safeRelease(psBgra);
         safeRelease(psNv12);
         safeRelease(vs);
@@ -151,10 +195,16 @@ struct D3d11VideoViewHost::Impl {
         samp.MaxLOD = D3D11_FLOAT32_MAX;
         device->CreateSamplerState(&samp, &sampler);
 
+        D3D11_RASTERIZER_DESC rasterDesc = {};
+        rasterDesc.FillMode = D3D11_FILL_SOLID;
+        rasterDesc.CullMode = D3D11_CULL_NONE;
+        rasterDesc.DepthClipEnable = TRUE;
+        device->CreateRasterizerState(&rasterDesc, &rasterizer);
+
         safeRelease(vsBlob);
         safeRelease(psNv12Blob);
         safeRelease(psBgraBlob);
-        shadersReady = vs && psNv12 && psBgra && sampler;
+        shadersReady = vs && psNv12 && psBgra && sampler && rasterizer;
         return shadersReady;
     }
 
@@ -220,67 +270,124 @@ struct D3d11VideoViewHost::Impl {
         return rtv != nullptr;
     }
 
-    void drawTexture(ID3D11Texture2D* texture, int slice)
+    bool drawTexture(ID3D11Texture2D* texture, int slice)
     {
-        if (!texture || !context || !rtv || !compileShaders()) return;
+        if (!texture || !context || !rtv || !compileShaders()) {
+            presentationAvailable = false;
+            writeHwLog(QStringLiteral("D3D11 present failed: renderer initialization unavailable"));
+            return false;
+        }
 
         D3D11_TEXTURE2D_DESC desc = {};
         texture->GetDesc(&desc);
+        if (!textureDescriptorLogged) {
+            textureDescriptorLogged = true;
+            writeHwLog(QStringLiteral(
+                "D3D11 decode texture: %1x%2 format=%3 array=%4 bind=%5 misc=%6")
+                .arg(desc.Width).arg(desc.Height).arg(static_cast<unsigned>(desc.Format))
+                .arg(desc.ArraySize).arg(hexValue(desc.BindFlags)).arg(hexValue(desc.MiscFlags)));
+        }
 
         const bool isNv12 = desc.Format == DXGI_FORMAT_NV12;
         const bool isBgra = desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
                             desc.Format == DXGI_FORMAT_B8G8R8X8_UNORM;
 
-        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-        srvDesc.Texture2DArray.MipLevels = 1;
-        srvDesc.Texture2D.MipLevels = 1;
-        if (desc.ArraySize > 1) {
-            srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
-            srvDesc.Texture2DArray.FirstArraySlice = static_cast<UINT>(slice);
-            srvDesc.Texture2DArray.ArraySize = 1;
-        } else {
-            srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-            (void)slice;
+        if (!(desc.BindFlags & D3D11_BIND_SHADER_RESOURCE)) {
+            presentationAvailable = false;
+            writeHwLog(QStringLiteral("D3D11 present failed: decode texture is not shader-readable"));
+            return false;
+        }
+        if (!isNv12 && !isBgra) {
+            presentationAvailable = false;
+            writeHwLog(QStringLiteral("D3D11 present failed: unsupported DXGI format=%1")
+                .arg(static_cast<unsigned>(desc.Format)));
+            return false;
         }
 
-        ID3D11ShaderResourceView* srv0 = nullptr;
-        ID3D11ShaderResourceView* srv1 = nullptr;
+        const UINT sourceSlice = desc.ArraySize > 1
+            ? static_cast<UINT>(std::max(0, std::min(slice, static_cast<int>(desc.ArraySize) - 1)))
+            : 0;
+        if (srvTexture != texture || srvSlice != sourceSlice) {
+            safeRelease(sampleSrv1);
+            safeRelease(sampleSrv0);
+            safeRelease(srvTexture);
+            srvTexture = texture;
+            srvTexture->AddRef();
+            srvSlice = sourceSlice;
 
-        if (isNv12) {
-            srvDesc.Format = DXGI_FORMAT_R8_UNORM;
-            device->CreateShaderResourceView(texture, &srvDesc, &srv0);
-            srvDesc.Format = DXGI_FORMAT_R8G8_UNORM;
-            device->CreateShaderResourceView(texture, &srvDesc, &srv1);
-        } else if (isBgra) {
-            srvDesc.Format = desc.Format;
-            device->CreateShaderResourceView(texture, &srvDesc, &srv0);
-        } else {
-            return;
+            D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+            srvDesc.ViewDimension = desc.ArraySize > 1
+                ? D3D11_SRV_DIMENSION_TEXTURE2DARRAY : D3D11_SRV_DIMENSION_TEXTURE2D;
+            if (desc.ArraySize > 1) {
+                srvDesc.Texture2DArray.MostDetailedMip = 0;
+                srvDesc.Texture2DArray.MipLevels = 1;
+                srvDesc.Texture2DArray.FirstArraySlice = sourceSlice;
+                srvDesc.Texture2DArray.ArraySize = 1;
+            } else {
+                srvDesc.Texture2D.MostDetailedMip = 0;
+                srvDesc.Texture2D.MipLevels = 1;
+            }
+            if (isNv12) {
+                srvDesc.Format = DXGI_FORMAT_R8_UNORM;
+                device->CreateShaderResourceView(texture, &srvDesc, &sampleSrv0);
+                srvDesc.Format = DXGI_FORMAT_R8G8_UNORM;
+                device->CreateShaderResourceView(texture, &srvDesc, &sampleSrv1);
+            } else {
+                srvDesc.Format = desc.Format;
+                device->CreateShaderResourceView(texture, &srvDesc, &sampleSrv0);
+            }
+            if (!zeroCopyLogged &&
+                ((isNv12 && sampleSrv0 && sampleSrv1) || (isBgra && sampleSrv0))) {
+                zeroCopyLogged = true;
+                writeHwLog(QStringLiteral(
+                    "D3D11 zero-copy verified: decoder texture sampled directly; "
+                    "slice=%1 srv=1 gpu-copy=0")
+                    .arg(sourceSlice));
+            }
+        }
+
+        if ((isNv12 && (!sampleSrv0 || !sampleSrv1)) || (isBgra && !sampleSrv0)) {
+            presentationAvailable = false;
+            writeHwLog(QStringLiteral("D3D11 present failed: shader resource view creation"));
+            return false;
         }
 
         const float clear[4] = {0.f, 0.f, 0.f, 1.f};
         context->OMSetRenderTargets(1, &rtv, nullptr);
         context->ClearRenderTargetView(rtv, clear);
+        D3D11_VIEWPORT viewport = {};
+        viewport.Width = static_cast<float>(width);
+        viewport.Height = static_cast<float>(height);
+        viewport.MinDepth = 0.0f;
+        viewport.MaxDepth = 1.0f;
+        context->RSSetViewports(1, &viewport);
+        context->RSSetState(rasterizer);
         context->IASetInputLayout(nullptr);
         context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         context->VSSetShader(vs, nullptr, 0);
         if (isNv12) {
             context->PSSetShader(psNv12, nullptr, 0);
-            context->PSSetShaderResources(0, 1, &srv0);
-            context->PSSetShaderResources(1, 1, &srv1);
+            context->PSSetShaderResources(0, 1, &sampleSrv0);
+            context->PSSetShaderResources(1, 1, &sampleSrv1);
         } else {
             context->PSSetShader(psBgra, nullptr, 0);
-            context->PSSetShaderResources(0, 1, &srv0);
+            context->PSSetShaderResources(0, 1, &sampleSrv0);
         }
         context->PSSetSamplers(0, 1, &sampler);
         context->Draw(3, 0);
 
         ID3D11ShaderResourceView* nullSrv[2] = {nullptr, nullptr};
         context->PSSetShaderResources(0, 2, nullSrv);
-        swapChain->Present(1, 0);
+        const HRESULT presentResult = swapChain->Present(1, 0);
+        if (FAILED(presentResult)) {
+            presentationAvailable = false;
+            writeHwLog(QStringLiteral("D3D11 present failed: swap chain HRESULT=%1")
+                .arg(hexValue(static_cast<unsigned long>(presentResult))));
+            return false;
+        }
+        presentationAvailable = true;
 
-        safeRelease(srv0);
-        safeRelease(srv1);
+        return true;
     }
 };
 
@@ -288,11 +395,14 @@ D3d11VideoViewHost::D3d11VideoViewHost(QWidget* parent)
     : QWidget(parent)
     , impl_(std::make_unique<Impl>())
 {
+    QFile::remove(QCoreApplication::applicationDirPath() + QStringLiteral("/ffplayer_hw.log"));
+    writeHwLog(QStringLiteral("D3D11 diagnostics started"));
     setAttribute(Qt::WA_NativeWindow);
     setAttribute(Qt::WA_DontCreateNativeAncestors);
+    setAttribute(Qt::WA_PaintOnScreen);
+    setAttribute(Qt::WA_NoSystemBackground);
     setAttribute(Qt::WA_OpaquePaintEvent);
     setAutoFillBackground(false);
-    setStyleSheet(QStringLiteral("background:#000;"));
 }
 
 D3d11VideoViewHost::~D3d11VideoViewHost() = default;
@@ -308,6 +418,7 @@ void D3d11VideoViewHost::setDecodeTexture(void* texture, int subresourceIndex,
     if (!texture) return;
     ensureInitialized();
     auto* tex = static_cast<ID3D11Texture2D*>(texture);
+    ++impl_->receivedFrames;
 
     ID3D11Device* texDevice = nullptr;
     tex->GetDevice(&texDevice);
@@ -320,7 +431,9 @@ void D3d11VideoViewHost::setDecodeTexture(void* texture, int subresourceIndex,
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         if (!impl_->swapChain || impl_->device != texDevice || impl_->width != w || impl_->height != h) {
-            impl_->createSwapChain(hwnd, texDevice, w, h);
+            if (!impl_->createSwapChain(hwnd, texDevice, w, h)) {
+                impl_->presentationAvailable = false;
+            }
         }
         safeRelease(impl_->pendingTex);
         impl_->pendingKeepAlive = std::move(keepAlive);
@@ -331,6 +444,22 @@ void D3d11VideoViewHost::setDecodeTexture(void* texture, int subresourceIndex,
     texDevice->Release();
 
     QTimer::singleShot(0, this, [this] { presentPending(); });
+}
+
+bool D3d11VideoViewHost::hardwarePresentationAvailable() const
+{
+    return impl_ && impl_->presentationAvailable.load();
+}
+
+QPaintEngine* D3d11VideoViewHost::paintEngine() const
+{
+    return nullptr;
+}
+
+void D3d11VideoViewHost::paintEvent(QPaintEvent* event)
+{
+    if (event) event->accept();
+    presentPending();
 }
 
 void D3d11VideoViewHost::presentPending()
@@ -359,7 +488,19 @@ void D3d11VideoViewHost::presentPending()
                           impl_->width != w || impl_->height != h)) {
             impl_->createSwapChain(hwnd, texDevice, w, h);
         }
-        impl_->drawTexture(tex, slice);
+        if (impl_->drawTexture(tex, slice)) ++impl_->presentedFrames;
+        else ++impl_->failedFrames;
+        const std::uint64_t attempts = impl_->presentedFrames + impl_->failedFrames;
+        if (attempts % 60 == 0 || impl_->failedFrames > 0) {
+            const double successRate = attempts > 0
+                ? 100.0 * static_cast<double>(impl_->presentedFrames) /
+                    static_cast<double>(attempts)
+                : 0.0;
+            writeHwLog(QStringLiteral(
+                "D3D11 stats: received=%1 presented=%2 failed=%3 success=%4%")
+                .arg(impl_->receivedFrames).arg(impl_->presentedFrames)
+                .arg(impl_->failedFrames).arg(successRate, 0, 'f', 2));
+        }
     }
 
     if (texDevice) texDevice->Release();

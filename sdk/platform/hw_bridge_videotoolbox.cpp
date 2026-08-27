@@ -47,7 +47,7 @@ int preferredVt()
     return static_cast<int>(AV_HWDEVICE_TYPE_VIDEOTOOLBOX);
 }
 
-const HwBridgeOps kOps{makeVt, canPresentVt, preferredVt};
+const HwBridgeOps kOps{makeVt, canPresentVt, preferredVt, nullptr};
 
 } // namespace
 

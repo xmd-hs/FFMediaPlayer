@@ -27,9 +27,27 @@ AVCodecParameters *copyParameters(AVFormatContext *format, int stream)
     }
     return parameters;
 }
+
+std::string metadataValue(const AVStream* stream, const char* key)
+{
+    if (!stream || !key) return {};
+    const AVDictionaryEntry* entry = av_dict_get(stream->metadata, key, nullptr, 0);
+    return entry && entry->value ? entry->value : "";
+}
 }
 
 FfmpegDemuxer::~FfmpegDemuxer() { close(); }
+
+void FfmpegDemuxer::setInterruptCallback(std::function<bool()> callback)
+{
+    interruptCallback_ = std::move(callback);
+}
+
+int FfmpegDemuxer::interrupt(void* opaque)
+{
+    const auto* self = static_cast<const FfmpegDemuxer*>(opaque);
+    return self && self->interruptCallback_ && self->interruptCallback_() ? 1 : 0;
+}
 
 bool FfmpegDemuxer::open(const std::string &url)
 {
@@ -38,9 +56,17 @@ bool FfmpegDemuxer::open(const std::string &url)
         lastError_ = "empty url";
         return false;
     }
+    format_ = avformat_alloc_context();
+    if (!format_) {
+        lastError_ = "format context allocation failed";
+        return false;
+    }
+    format_->interrupt_callback.callback = &FfmpegDemuxer::interrupt;
+    format_->interrupt_callback.opaque = this;
     int result = avformat_open_input(&format_, url.c_str(), nullptr, nullptr);
     if (result < 0) {
         lastError_ = "open input failed: " + errorText(result);
+        avformat_free_context(format_);
         format_ = nullptr;
         return false;
     }
@@ -114,6 +140,8 @@ std::vector<TrackInfo> FfmpegDemuxer::audioTracks() const
         if (format_->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
             TrackInfo track;
             track.streamIndex = static_cast<int>(i);
+            track.language = metadataValue(format_->streams[i], "language");
+            track.title = metadataValue(format_->streams[i], "title");
             track.codec = avcodec_get_name(format_->streams[i]->codecpar->codec_id);
             tracks.push_back(track);
         }
@@ -129,6 +157,8 @@ std::vector<TrackInfo> FfmpegDemuxer::subtitleTracks() const
         if (format_->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE) {
             TrackInfo track;
             track.streamIndex = static_cast<int>(i);
+            track.language = metadataValue(format_->streams[i], "language");
+            track.title = metadataValue(format_->streams[i], "title");
             track.codec = avcodec_get_name(format_->streams[i]->codecpar->codec_id);
             tracks.push_back(track);
         }

@@ -64,6 +64,8 @@ void AudioTempoFilter::close()
     }
     src_ = nullptr;
     sink_ = nullptr;
+    av_frame_free(&inputFrame_);
+    av_frame_free(&outputFrame_);
     tempo_ = 1.0;
     pts_ = 0;
 }
@@ -162,6 +164,12 @@ bool AudioTempoFilter::process(const std::int16_t* input, int inputFrames,
 {
     outputInterleaved.clear();
     if (!input || inputFrames <= 0) return false;
+    const auto estimatedFrames = static_cast<std::size_t>(
+        std::ceil(inputFrames / std::max(tempo_, 0.25))) + 256;
+    const auto estimatedSamples = estimatedFrames * static_cast<std::size_t>(channels_);
+    if (outputInterleaved.capacity() < estimatedSamples) {
+        outputInterleaved.reserve(estimatedSamples);
+    }
 
     // Bypass when tempo ~ 1 or filter unavailable.
     if (!graph_ || std::fabs(tempo_ - 1.0) <= 1e-3) {
@@ -169,45 +177,50 @@ bool AudioTempoFilter::process(const std::int16_t* input, int inputFrames,
         return true;
     }
 
-    AVFrame* frame = av_frame_alloc();
-    if (!frame) return false;
-    frame->format = AV_SAMPLE_FMT_S16;
-    frame->sample_rate = sampleRate_;
-    frame->nb_samples = inputFrames;
-    av_channel_layout_default(&frame->ch_layout, channels_);
-    frame->pts = pts_;
+    if (!inputFrame_) inputFrame_ = av_frame_alloc();
+    if (!outputFrame_) outputFrame_ = av_frame_alloc();
+    if (!inputFrame_ || !outputFrame_) return false;
+
+    av_frame_unref(inputFrame_);
+    inputFrame_->format = AV_SAMPLE_FMT_S16;
+    inputFrame_->sample_rate = sampleRate_;
+    inputFrame_->nb_samples = inputFrames;
+    av_channel_layout_default(&inputFrame_->ch_layout, channels_);
+    inputFrame_->pts = pts_;
     pts_ += inputFrames;
 
-    if (av_frame_get_buffer(frame, 0) < 0) {
-        av_frame_free(&frame);
-        return false;
-    }
+    if (av_frame_get_buffer(inputFrame_, 0) < 0) return false;
     const int bytes = inputFrames * channels_ * static_cast<int>(sizeof(std::int16_t));
-    std::memcpy(frame->data[0], input, static_cast<std::size_t>(bytes));
+    std::memcpy(inputFrame_->data[0], input, static_cast<std::size_t>(bytes));
 
-    if (av_buffersrc_add_frame_flags(src_, frame, AV_BUFFERSRC_FLAG_KEEP_REF) < 0) {
-        av_frame_free(&frame);
+    if (av_buffersrc_add_frame_flags(src_, inputFrame_, AV_BUFFERSRC_FLAG_KEEP_REF) < 0)
         return false;
-    }
-    av_frame_free(&frame);
 
+    return collectOutput(outputInterleaved);
+}
+
+bool AudioTempoFilter::drain(std::vector<std::int16_t>& outputInterleaved)
+{
+    outputInterleaved.clear();
+    if (!graph_) return true;
+    if (av_buffersrc_add_frame_flags(src_, nullptr, 0) < 0) return false;
+    return collectOutput(outputInterleaved);
+}
+
+bool AudioTempoFilter::collectOutput(std::vector<std::int16_t>& outputInterleaved)
+{
+    if (!outputFrame_) return false;
     for (;;) {
-        AVFrame* out = av_frame_alloc();
-        if (!out) return false;
-        const int ret = av_buffersink_get_frame(sink_, out);
+        av_frame_unref(outputFrame_);
+        const int ret = av_buffersink_get_frame(sink_, outputFrame_);
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-            av_frame_free(&out);
             break;
         }
-        if (ret < 0) {
-            av_frame_free(&out);
-            return false;
-        }
-        const int frames = out->nb_samples;
-        const auto* samples = reinterpret_cast<const std::int16_t*>(out->data[0]);
+        if (ret < 0) return false;
+        const int frames = outputFrame_->nb_samples;
+        const auto* samples = reinterpret_cast<const std::int16_t*>(outputFrame_->data[0]);
         outputInterleaved.insert(outputInterleaved.end(), samples,
                                  samples + static_cast<std::size_t>(frames) * channels_);
-        av_frame_free(&out);
     }
     return true;
 }

@@ -9,6 +9,7 @@ void PlatformVideoSink::onVideoFrame(const VideoFrame &frame)
     frame_ = {};
     frame_.width = frame.width;
     frame_.height = frame.height;
+    frame_.format = frame.format;
     frame_.ptsMs = frame.ptsMs;
     for (int i = 0; i < 3; ++i) {
         planes_[i].clear();

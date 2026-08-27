@@ -3,6 +3,7 @@
 #include "../include/player_types.h"
 #include <string>
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 struct AVFormatContext;
@@ -20,6 +21,7 @@ public:
     FfmpegDemuxer& operator=(const FfmpegDemuxer&) = delete;
 
     bool open(const std::string& url);
+    void setInterruptCallback(std::function<bool()> callback);
     void close();
     AVPacket* read();
     bool seek(MediaTimeMs positionMs);
@@ -38,7 +40,9 @@ public:
     const std::string& lastError() const { return lastError_; }
 
 private:
+    static int interrupt(void* opaque);
     AVFormatContext* format_ = nullptr;
+    std::function<bool()> interruptCallback_;
     MediaTimeMs durationMs_ = 0;
     int videoStream_ = -1;
     int audioStream_ = -1;
