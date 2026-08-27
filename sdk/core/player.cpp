@@ -39,5 +39,8 @@ MediaTimeMs Player::position() const { return impl_->session.position(); }
 MediaTimeMs Player::duration() const { return impl_->session.duration(); }
 void Player::setVolume(float volume) { impl_->session.setVolume(volume); }
 void Player::setSpeed(double speed) { impl_->session.setSpeed(speed); }
+void Player::setHwAccelEnabled(bool enabled) { impl_->session.setHwAccelEnabled(enabled); }
+bool Player::hwAccelEnabled() const { return impl_->session.hwAccelEnabled(); }
+bool Player::videoHwAccelActive() const { return impl_->session.videoHwAccelActive(); }
 
 } // namespace ffplayer

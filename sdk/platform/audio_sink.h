@@ -6,6 +6,7 @@ class PlatformAudioSink final : public IAudioSink {
 public:
     bool onAudioChunk(const AudioChunk &chunk) override;
     MediaTimeMs bufferedDurationMs() const override;
+    void flush() override;
 
 private:
     MediaTimeMs bufferedMs_ = 0;

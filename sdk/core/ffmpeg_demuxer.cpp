@@ -34,14 +34,33 @@ FfmpegDemuxer::~FfmpegDemuxer() { close(); }
 bool FfmpegDemuxer::open(const std::string &url)
 {
     close();
-    if (url.empty() || avformat_open_input(&format_, url.c_str(), nullptr, nullptr) < 0)
+    if (url.empty()) {
+        lastError_ = "empty url";
         return false;
-    if (avformat_find_stream_info(format_, nullptr) < 0) { close(); return false; }
+    }
+    int result = avformat_open_input(&format_, url.c_str(), nullptr, nullptr);
+    if (result < 0) {
+        lastError_ = "open input failed: " + errorText(result);
+        format_ = nullptr;
+        return false;
+    }
+    result = avformat_find_stream_info(format_, nullptr);
+    if (result < 0) {
+        lastError_ = "find stream info failed: " + errorText(result);
+        close();
+        return false;
+    }
     videoStream_ = av_find_best_stream(format_, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
     audioStream_ = av_find_best_stream(format_, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
     subtitleStream_ = av_find_best_stream(format_, AVMEDIA_TYPE_SUBTITLE, -1, -1, nullptr, 0);
     durationMs_ = format_->duration > 0 ? av_rescale_q(format_->duration, AV_TIME_BASE_Q, {1, 1000}) : 0;
-    return videoStream_ >= 0 || audioStream_ >= 0;
+    if (videoStream_ < 0 && audioStream_ < 0) {
+        lastError_ = "no audio or video stream";
+        close();
+        return false;
+    }
+    lastError_.clear();
+    return true;
 }
 
 void FfmpegDemuxer::close()
@@ -57,10 +76,17 @@ AVPacket *FfmpegDemuxer::read()
     auto *packet = av_packet_alloc();
     if (!packet) return nullptr;
     const int result = av_read_frame(format_, packet);
-    if (result < 0) { av_packet_free(&packet); if (result != AVERROR_EOF) lastError_ = errorText(result); return nullptr; }
+    if (result < 0) {
+        av_packet_free(&packet);
+        if (result == AVERROR_EOF) lastError_.clear();
+        else lastError_ = errorText(result);
+        return nullptr;
+    }
+    lastError_.clear();
     const auto timeBase = format_->streams[packet->stream_index]->time_base;
     if (packet->pts != AV_NOPTS_VALUE) packet->pts = av_rescale_q(packet->pts, timeBase, {1, 1000});
     if (packet->dts != AV_NOPTS_VALUE) packet->dts = av_rescale_q(packet->dts, timeBase, {1, 1000});
+    if (packet->duration > 0) packet->duration = av_rescale_q(packet->duration, timeBase, {1, 1000});
     return packet;
 }
 

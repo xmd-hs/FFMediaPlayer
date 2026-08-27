@@ -12,7 +12,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(PkgConfig QUIET)
 if (PkgConfig_FOUND AND NOT FFMPEG_ROOT)
     pkg_check_modules(FFMPEG QUIET IMPORTED_TARGET
-        libavformat libavcodec libavutil libswresample libswscale)
+        libavformat libavcodec libavutil libswresample libswscale libavfilter)
 endif()
 
 if (NOT TARGET PkgConfig::FFMPEG)
@@ -35,12 +35,13 @@ if (NOT TARGET PkgConfig::FFMPEG)
     find_library(AVUTIL_LIBRARY avutil HINTS ${FFMPEG_ROOT} ENV FFMPEG_ROOT PATH_SUFFIXES ${FFMPEG_LIB_SUFFIXES})
     find_library(SWRESAMPLE_LIBRARY swresample HINTS ${FFMPEG_ROOT} ENV FFMPEG_ROOT PATH_SUFFIXES ${FFMPEG_LIB_SUFFIXES})
     find_library(SWSCALE_LIBRARY swscale HINTS ${FFMPEG_ROOT} ENV FFMPEG_ROOT PATH_SUFFIXES ${FFMPEG_LIB_SUFFIXES})
-    if (NOT FFMPEG_INCLUDE_DIR OR NOT AVFORMAT_LIBRARY OR NOT AVCODEC_LIBRARY OR NOT AVUTIL_LIBRARY OR NOT SWRESAMPLE_LIBRARY OR NOT SWSCALE_LIBRARY)
+    find_library(AVFILTER_LIBRARY avfilter HINTS ${FFMPEG_ROOT} ENV FFMPEG_ROOT PATH_SUFFIXES ${FFMPEG_LIB_SUFFIXES})
+    if (NOT FFMPEG_INCLUDE_DIR OR NOT AVFORMAT_LIBRARY OR NOT AVCODEC_LIBRARY OR NOT AVUTIL_LIBRARY OR NOT SWRESAMPLE_LIBRARY OR NOT SWSCALE_LIBRARY OR NOT AVFILTER_LIBRARY)
         message(FATAL_ERROR "FFmpeg not found. Install FFmpeg development files or set FFMPEG_ROOT.")
     endif()
     add_library(ffmpeg_local INTERFACE)
     target_include_directories(ffmpeg_local INTERFACE ${FFMPEG_INCLUDE_DIR})
-    target_link_libraries(ffmpeg_local INTERFACE ${AVFORMAT_LIBRARY} ${AVCODEC_LIBRARY} ${AVUTIL_LIBRARY} ${SWRESAMPLE_LIBRARY} ${SWSCALE_LIBRARY})
+    target_link_libraries(ffmpeg_local INTERFACE ${AVFORMAT_LIBRARY} ${AVCODEC_LIBRARY} ${AVUTIL_LIBRARY} ${SWRESAMPLE_LIBRARY} ${SWSCALE_LIBRARY} ${AVFILTER_LIBRARY})
     add_library(PkgConfig::FFMPEG ALIAS ffmpeg_local)
 endif()
 
@@ -49,8 +50,10 @@ add_library(ffplayer_sdk STATIC
     core/player_session.cpp
     core/player.cpp
     core/ffmpeg_demuxer.cpp
-    core/ffmpeg_decoder.cpp)
+    core/ffmpeg_decoder.cpp
+    core/audio_tempo.cpp)
 target_sources(ffplayer_sdk PRIVATE core/ffmpeg_subtitle_decoder.cpp)
+target_sources(ffplayer_sdk PRIVATE core/hw_frame_bridge.cpp)
 target_sources(ffplayer_sdk PRIVATE platform/audio_sink.cpp platform/video_sink.cpp)
 
 target_include_directories(ffplayer_sdk PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/include> $<INSTALL_INTERFACE:include/ffplayer>)
@@ -77,4 +80,13 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/ffplayer_sdkConfig.cmake ${CMAKE_CURRE
 
 if (UNIX AND NOT APPLE)
     target_link_libraries(ffplayer_sdk PRIVATE pthread)
+endif()
+
+if (APPLE)
+    # VideoToolbox hwaccel (phase-1 hard decode).
+    target_link_libraries(ffplayer_sdk PRIVATE
+        "-framework VideoToolbox"
+        "-framework CoreMedia"
+        "-framework CoreVideo"
+        "-framework CoreFoundation")
 endif()

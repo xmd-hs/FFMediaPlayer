@@ -2,20 +2,16 @@
 
 #include <QMainWindow>
 #include <QTimer>
-#include <QImage>
-#include <QIODevice>
-#include <QByteArray>
-#include <QMutex>
 
 #include "../../sdk/include/player.h"
-
-class QLabel; class QPushButton; class QSlider;
-class QAudioOutput;
-class QIODevice;
-class QMutex;
-class QWaitCondition;
-
 #include "adapters/qt_sinks.h"
+
+class QLabel;
+class QPushButton;
+class QSlider;
+class QComboBox;
+class MetalVideoViewHost;
+class D3d11VideoViewHost;
 
 class PlayerWindow final : public QMainWindow {
 public:
@@ -25,13 +21,23 @@ public:
 private:
     void openFile();
     void togglePlayback();
+
     QLabel *videoView_ = nullptr;
+#if defined(Q_OS_MAC)
+    MetalVideoViewHost *metalHost_ = nullptr;
+#endif
+#if defined(Q_OS_WIN)
+    D3d11VideoViewHost *d3dHost_ = nullptr;
+#endif
+    QLabel *subtitleLabel_ = nullptr;
     QLabel *status_ = nullptr;
     QPushButton *playButton_ = nullptr;
     QSlider *progress_ = nullptr;
     QSlider *volume_ = nullptr;
+    QComboBox *speedBox_ = nullptr;
     QTimer timer_;
     ffplayer::Player player_;
     QtVideoSink videoSink_;
     QtAudioSink audioSink_;
+    QtSubtitleSink subtitleSink_;
 };

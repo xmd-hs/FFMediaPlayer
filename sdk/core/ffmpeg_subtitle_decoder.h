@@ -1,14 +1,36 @@
 #pragma once
 #include "../include/player_types.h"
 #include <string>
-struct AVCodecContext; struct AVCodecParameters; struct AVPacket;
+#include <vector>
+
+struct AVCodecContext;
+struct AVCodecParameters;
+struct AVPacket;
+
 namespace ffplayer {
+
+struct DecodedSubtitle {
+    std::string text;
+    SubtitleImage image;
+    bool hasText = false;
+    bool hasImage = false;
+};
+
 class FfmpegSubtitleDecoder {
 public:
+    FfmpegSubtitleDecoder() = default;
     ~FfmpegSubtitleDecoder();
+    FfmpegSubtitleDecoder(const FfmpegSubtitleDecoder&) = delete;
+    FfmpegSubtitleDecoder& operator=(const FfmpegSubtitleDecoder&) = delete;
+    FfmpegSubtitleDecoder(FfmpegSubtitleDecoder&& other) noexcept;
+    FfmpegSubtitleDecoder& operator=(FfmpegSubtitleDecoder&& other) noexcept;
     bool open(const AVCodecParameters* parameters);
     void close();
-    bool decode(AVPacket* packet, std::string& text, MediaTimeMs& startMs, MediaTimeMs& endMs);
-private: AVCodecContext* context_ = nullptr;
+    void flush();
+    bool decode(AVPacket* packet, DecodedSubtitle& out);
+
+private:
+    AVCodecContext* context_ = nullptr;
 };
-}
+
+} // namespace ffplayer

@@ -8,6 +8,7 @@ void MediaClock::reset(MediaTimeMs positionMs)
     std::lock_guard<std::mutex> lock(mutex_);
     baseMs_ = std::max<MediaTimeMs>(0, positionMs);
     startedAt_ = std::chrono::steady_clock::now();
+    running_ = false;
 }
 
 void MediaClock::start()

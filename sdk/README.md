@@ -9,11 +9,18 @@ Player
   -> PlayerSession
      -> FfmpegDemuxer       FFmpeg 解复用
      -> 数据包队列
-     -> FfmpegDecoder       FFmpeg 解码
+     -> FfmpegDecoder       FFmpeg 解码（视频可硬解，失败回退软解）
      -> 音频重采样          IAudioSink
      -> 像素格式转换        IVideoSink
      -> 字幕解码            ISubtitleSink
 ```
+
+## 视频硬解
+
+- **一期**：硬解 + `av_hwframe_transfer_data` 回 CPU，走原有 `onVideoFrame`。
+- **二期（macOS / Windows）**：VideoToolbox 或 D3D11 表面经 `HwVideoFrame` / `onHwVideoFrame` 零拷贝呈图；失败自动回退一期/软解。
+
+`Player::setHwAccelEnabled(false)` 可强制软解；`videoHwAccelActive()` 查询是否硬解成功。
 
 `Player` 是对外唯一入口，`PlayerSession` 负责会话状态、线程、队列、时钟、解复用和解码。SDK 内部不包含 Qt、窗口或平台音频视频 API。
 
