@@ -43,8 +43,24 @@ Player
 未打开媒体时，它设置下一次 `open()` 的解码偏好（仅在编译开启硬解时有效）。
 
 Windows Qt 示例会在应用目录写入 `ffplayer_hw.log`。出现
-`D3D11 zero-copy verified ... gpu-copy=0` 表示解码纹理已被直接采样；
-软硬解切换会输出 `[ffplayer] hw-switch ...` 到标准错误流。
+`D3D11 zero-copy verified ... gpu-copy=0` 表示 FFmpeg 的 D3D11 解码纹理已被
+直接创建 Shader Resource View 并采样；该标记只在纹理支持采样且 SRV 创建成功后输出。
+若硬件、驱动或编码格式不支持，解码器会回退软解，且不会输出该成功标记。
+
+播放中调用 `setHwAccelEnabled()` 时，标准错误流会依次输出
+`[ffplayer] hw-switch requested`、`decoder rebuilt`、`completed`。其中
+`active=hardware` 表示目标硬解已启用，`active=software` 表示已回退软解。切换在
+当前位置重建解码器、seek 到关键帧并恢复播放，属于受控重建流程，不承诺单帧无缝。
+
+典型 Windows D3D11 成功日志如下：
+
+```text
+D3D11 decode texture: 320x176 format=103 array=17 bind=0x208 misc=0x0
+D3D11 zero-copy verified: decoder texture sampled directly; slice=13 srv=1 gpu-copy=0
+D3D11 stats: received=180 presented=180 failed=0 success=100.00%
+```
+
+`format=103` 为 `DXGI_FORMAT_NV12`，`bind=0x208` 包含解码与着色器资源绑定标志。
 
 ## 编译
 
