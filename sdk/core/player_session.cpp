@@ -22,6 +22,14 @@ namespace ffplayer {
 namespace {
 constexpr int kOutputSampleRate = 48000;
 constexpr int kOutputChannels = 2;
+
+// Adaptive A/V sync thresholds (milliseconds).
+constexpr MediaTimeMs kSyncEarlyMs = 20;         // start waiting when video is this far ahead
+constexpr MediaTimeMs kSyncLatePresentMs = 60;   // still present if only slightly late
+constexpr MediaTimeMs kSyncLateDropMs = 120;     // drop when this late (normal mode)
+constexpr MediaTimeMs kSyncCatchUpEnterMs = 280; // enter aggressive catch-up
+constexpr MediaTimeMs kSyncCatchUpExitMs = 100;  // leave catch-up when within this
+constexpr MediaTimeMs kSyncMaxWaitMs = 250;      // cap a single wait
 }
 
 PlayerSession::PlayerSession() = default;
@@ -71,6 +79,61 @@ void PlayerSession::wakeQueues()
     videoPackets_.wakeWaiters();
     audioPackets_.wakeWaiters();
     subtitlePackets_.wakeWaiters();
+    notifyPlayback();
+}
+
+void PlayerSession::notifyPlayback()
+{
+    playbackCv_.notify_all();
+}
+
+void PlayerSession::waitWhilePaused()
+{
+    if (stopRequested_ || eofDrainActive_ || !paused_) return;
+    std::unique_lock<std::mutex> lock(playbackMutex_);
+    playbackCv_.wait(lock, [&] {
+        return stopRequested_ || !paused_ || eofDrainActive_;
+    });
+}
+
+void PlayerSession::waitForDemux()
+{
+    std::unique_lock<std::mutex> lock(playbackMutex_);
+    playbackCv_.wait(lock, [&] {
+        return stopRequested_ || (!paused_ && !demuxAtEof_);
+    });
+}
+
+void PlayerSession::waitForMasterClock(const MediaTimeMs targetPts, const std::uint64_t epoch)
+{
+    if (targetPts <= 0) return;
+    std::unique_lock<std::mutex> lock(playbackMutex_);
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(kSyncMaxWaitMs);
+    playbackCv_.wait_until(lock, deadline, [&] {
+        if (stopRequested_ || !epochIsCurrent(epoch) || paused_) return true;
+        return masterClockMs() >= targetPts;
+    });
+}
+
+void PlayerSession::releaseVideoFrame(AVFrame* frame)
+{
+    if (!frame) return;
+    videoDecoder_.releaseFrame(frame);
+}
+
+bool PlayerSession::shouldDropVideoFrame(const MediaTimeMs pts, const MediaTimeMs master,
+                                         bool& catchUpMode) const
+{
+    if (master <= 0) return false;
+    const MediaTimeMs delta = pts - master; // positive = video ahead
+
+    if (delta < -kSyncCatchUpEnterMs) catchUpMode = true;
+    else if (catchUpMode && delta > -kSyncCatchUpExitMs) catchUpMode = false;
+
+    const MediaTimeMs dropThreshold =
+        catchUpMode ? kSyncLatePresentMs : kSyncLateDropMs;
+    return delta < -dropThreshold;
 }
 
 void PlayerSession::beginEofDrain()
@@ -82,6 +145,7 @@ void PlayerSession::beginEofDrain()
 void PlayerSession::endEofDrain()
 {
     eofDrainActive_ = false;
+    notifyPlayback();
 }
 
 void PlayerSession::pushPipelineEofSentinels(const std::uint64_t epoch)
@@ -120,9 +184,7 @@ bool PlayerSession::pushPacket(PacketQueue<AVPacket*>& queue, AVPacket* packet, 
             return false;
         }
         if (queue.push(packet, &paused_)) return true;
-        while (paused_ && !stopRequested_ && epochIsCurrent(epoch)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        }
+        waitWhilePaused();
         if (stopRequested_ || !epochIsCurrent(epoch)) break;
     }
     freePacket(packet);
@@ -141,7 +203,13 @@ bool PlayerSession::pushEofSentinel(PacketQueue<AVPacket*>& queue, std::uint64_t
             return true;
         }
         wakeQueues();
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        {
+            std::unique_lock<std::mutex> lock(playbackMutex_);
+            playbackCv_.wait_for(lock, std::chrono::milliseconds(10), [&] {
+                return stopRequested_ || !epochIsCurrent(epoch) ||
+                    !demuxAtEof_.load(std::memory_order_acquire);
+            });
+        }
     }
     return false;
 }
@@ -177,6 +245,9 @@ bool PlayerSession::open(const std::string& url)
     paused_ = true;
     audioClockMs_ = 0;
     videoClockMs_ = 0;
+    videoCatchUp_ = false;
+    videoFramePool_.clear();
+    scalerFramePool_.clear();
     {
         std::lock_guard<std::mutex> lock(mutex_);
         url_ = url;
@@ -194,6 +265,7 @@ bool PlayerSession::open(const std::string& url)
             setState(PlaybackState::Error);
             return false;
         }
+        videoDecoder_.setFramePool(&videoFramePool_);
     }
     if (ap) {
         const bool opened = audioDecoder_.open(ap, false);
@@ -204,6 +276,7 @@ bool PlayerSession::open(const std::string& url)
             setState(PlaybackState::Error);
             return false;
         }
+        audioDecoder_.setFramePool(nullptr);
     }
     if (sp) {
         const bool opened = subtitleDecoder_.open(sp);
@@ -257,6 +330,9 @@ void PlayerSession::close()
     subtitlePump_ = false;
     eofWorkers_ = 0;
     finishedNotified_ = false;
+    videoCatchUp_ = false;
+    videoFramePool_.clear();
+    scalerFramePool_.clear();
     std::lock_guard<std::mutex> lock(mutex_);
     url_.clear();
     durationMs_ = 0;
@@ -354,6 +430,9 @@ bool PlayerSession::seek(MediaTimeMs positionMs)
     clock_.reset(positionMs);
     audioClockMs_ = positionMs;
     videoClockMs_ = positionMs;
+    videoCatchUp_ = false;
+    videoFramePool_.clear();
+    scalerFramePool_.clear();
     paused_ = !wasPlaying;
     if (wasPlaying) {
         clock_.start();
@@ -445,18 +524,11 @@ bool PlayerSession::selectSubtitleTrack(int streamIndex)
     return true;
 }
 
-void PlayerSession::waitIfPaused()
-{
-    while (paused_ && !eofDrainActive_ && !stopRequested_) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    }
-}
-
 bool PlayerSession::sendPacket(FfmpegDecoder& decoder, AVPacket*& packet, std::mutex& codecMutex,
                                std::uint64_t epoch)
 {
     while (!stopRequested_ && packet) {
-        waitIfPaused();
+        waitWhilePaused();
         if (stopRequested_) break;
         if (!epochIsCurrent(epoch)) {
             freePacket(packet);
@@ -479,7 +551,7 @@ bool PlayerSession::sendPacket(FfmpegDecoder& decoder, AVPacket*& packet, std::m
         {
             std::lock_guard<std::mutex> lock(codecMutex);
             while (AVFrame* frame = decoder.receive()) {
-                av_frame_free(&frame);
+                decoder.releaseFrame(frame);
             }
             result = decoder.send(packet);
         }
@@ -523,6 +595,7 @@ void PlayerSession::notifyStreamFinished(std::uint64_t epoch)
         endEofDrain();
         paused_ = true;
         clock_.pause();
+        notifyPlayback();
         // Keep Error if demux already failed; only report Ended for clean EOF.
         if (state() != PlaybackState::Error) {
             setState(PlaybackState::Ended);
@@ -559,7 +632,7 @@ void PlayerSession::demuxLoop()
 {
     while (!stopRequested_) {
         if (paused_ || demuxAtEof_) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            waitForDemux();
             continue;
         }
 
@@ -654,7 +727,7 @@ void PlayerSession::demuxLoop()
 void PlayerSession::subtitleLoop()
 {
     while (!stopRequested_) {
-        waitIfPaused();
+        waitWhilePaused();
         if (stopRequested_) break;
 
         AVPacket* packet = nullptr;
@@ -678,13 +751,11 @@ void PlayerSession::subtitleLoop()
             const MediaTimeMs endMs = decoded.image.endMs;
             MediaTimeMs now = 0;
             while (!stopRequested_ && epochIsCurrent(epoch) && startMs > 0) {
-                waitIfPaused();
+                waitWhilePaused();
                 if (stopRequested_ || !epochIsCurrent(epoch)) break;
                 now = masterClockMs();
-                // Wait until the master clock reaches start; do not treat clock==0 as "ready".
                 if (now >= startMs) break;
-                const auto sleepMs = std::min<MediaTimeMs>(5, startMs - now);
-                std::this_thread::sleep_for(std::chrono::milliseconds(std::max<MediaTimeMs>(1, sleepMs)));
+                waitForMasterClock(startMs, epoch);
             }
             if (!stopRequested_ && epochIsCurrent(epoch)) {
                 now = masterClockMs();
@@ -721,9 +792,9 @@ void PlayerSession::presentVideoFrame(AVFrame* frame, MediaTimeMs pts, std::uint
     AVFrame* ownedTransfer = nullptr;
     AVFrame* yuv = frame;
     if (isHardwarePixelFormat(frame->format)) {
-        AVFrame* sw = av_frame_alloc();
+        AVFrame* sw = videoFramePool_.acquire();
         if (!sw || av_hwframe_transfer_data(sw, frame, 0) < 0) {
-            if (sw) av_frame_free(&sw);
+            if (sw) videoFramePool_.release(sw);
             return;
         }
         av_frame_copy_props(sw, frame);
@@ -744,27 +815,20 @@ void PlayerSession::presentVideoFrame(AVFrame* frame, MediaTimeMs pts, std::uint
             scalerSrcH_ = yuv->height;
             scalerSrcFormat_ = yuv->format;
         }
-        converted = av_frame_alloc();
-        if (!converted) {
-            if (ownedTransfer) av_frame_free(&ownedTransfer);
-            return;
-        }
-        converted->format = AV_PIX_FMT_YUV420P;
-        converted->width = yuv->width;
-        converted->height = yuv->height;
-        if (av_frame_get_buffer(converted, 32) < 0 || !scaler_ ||
+        converted = scalerFramePool_.acquire(yuv->width, yuv->height, AV_PIX_FMT_YUV420P);
+        if (!converted || !scaler_ ||
             sws_scale(scaler_, yuv->data, yuv->linesize, 0, yuv->height,
                       converted->data, converted->linesize) <= 0) {
-            av_frame_free(&converted);
-            if (ownedTransfer) av_frame_free(&ownedTransfer);
+            if (converted) scalerFramePool_.release(converted);
+            if (ownedTransfer) videoFramePool_.release(ownedTransfer);
             return;
         }
         yuv = converted;
     }
 
     if (!epochIsCurrent(epoch)) {
-        if (converted) av_frame_free(&converted);
-        if (ownedTransfer) av_frame_free(&ownedTransfer);
+        if (converted) scalerFramePool_.release(converted);
+        if (ownedTransfer) videoFramePool_.release(ownedTransfer);
         return;
     }
 
@@ -777,59 +841,61 @@ void PlayerSession::presentVideoFrame(AVFrame* frame, MediaTimeMs pts, std::uint
     out.height = yuv->height;
     out.ptsMs = pts;
     videoSink_->onVideoFrame(out);
-    if (converted) av_frame_free(&converted);
-    if (ownedTransfer) av_frame_free(&ownedTransfer);
+    if (converted) scalerFramePool_.release(converted);
+    if (ownedTransfer) videoFramePool_.release(ownedTransfer);
 }
 
 bool PlayerSession::handleVideoFrame(AVFrame* frame, std::uint64_t epoch)
 {
     if (!frame) return false;
     if (!epochIsCurrent(epoch)) {
-        av_frame_free(&frame);
+        releaseVideoFrame(frame);
         return false;
     }
     // EOF drain while user paused: flush decoder state without presenting.
     if (paused_.load(std::memory_order_acquire) &&
         eofDrainActive_.load(std::memory_order_acquire)) {
-        av_frame_free(&frame);
+        releaseVideoFrame(frame);
         return true;
     }
     const MediaTimeMs pts = frame->pts < 0 ? videoClockMs_.load() : frame->pts;
     videoClockMs_ = pts;
     const MediaTimeMs master = masterClockMs();
-    double speed = 1.0;
-    {
-        std::lock_guard<std::mutex> lock(resamplerMutex_);
-        if (tempoFilter_.valid() && std::fabs(speed_.load() - 1.0) > 1e-3) {
-            speed = std::max(0.01, speed_.load());
-        }
-    }
-    if (master >= 0 && pts > master + 40) {
-        const MediaTimeMs delay = std::min<MediaTimeMs>(pts - master, 100);
-        const auto sleepMs = static_cast<MediaTimeMs>(delay / speed);
-        for (MediaTimeMs slept = 0; slept < sleepMs && !stopRequested_ && epochIsCurrent(epoch);) {
-            if (paused_) break;
-            const MediaTimeMs step = std::min<MediaTimeMs>(sleepMs - slept, 5);
-            std::this_thread::sleep_for(std::chrono::milliseconds(step));
-            slept += step;
-        }
-        if (!epochIsCurrent(epoch) || stopRequested_ || paused_) {
-            av_frame_free(&frame);
-            return false;
-        }
-    } else if (master > 0 && pts + 250 < master) {
-        av_frame_free(&frame);
+
+    bool catchUp = videoCatchUp_.load(std::memory_order_acquire);
+    if (shouldDropVideoFrame(pts, master, catchUp)) {
+        videoCatchUp_.store(catchUp, std::memory_order_release);
+        releaseVideoFrame(frame);
         return true;
     }
+    videoCatchUp_.store(catchUp, std::memory_order_release);
+
+    if (master >= 0 && pts > master + kSyncEarlyMs) {
+        const MediaTimeMs target = pts - kSyncEarlyMs / 2;
+        waitForMasterClock(target, epoch);
+        if (!epochIsCurrent(epoch) || stopRequested_ || paused_) {
+            releaseVideoFrame(frame);
+            return false;
+        }
+        const MediaTimeMs refreshed = masterClockMs();
+        catchUp = videoCatchUp_.load(std::memory_order_acquire);
+        if (shouldDropVideoFrame(pts, refreshed, catchUp)) {
+            videoCatchUp_.store(catchUp, std::memory_order_release);
+            releaseVideoFrame(frame);
+            return true;
+        }
+        videoCatchUp_.store(catchUp, std::memory_order_release);
+    }
+
     presentVideoFrame(frame, pts, epoch);
-    av_frame_free(&frame);
+    releaseVideoFrame(frame);
     return true;
 }
 
 void PlayerSession::videoLoop()
 {
     while (!stopRequested_) {
-        waitIfPaused();
+        waitWhilePaused();
         if (stopRequested_) break;
 
         const bool preferHwSurface =
@@ -850,7 +916,7 @@ void PlayerSession::videoLoop()
             }
             for (AVFrame* frame : drained) {
                 if (epochIsCurrent(epoch)) handleVideoFrame(frame, epoch);
-                else av_frame_free(&frame);
+                else releaseVideoFrame(frame);
             }
             notifyStreamFinished(epoch);
             continue;
@@ -862,7 +928,7 @@ void PlayerSession::videoLoop()
         }
 
         while (packet && !stopRequested_) {
-            waitIfPaused();
+            waitWhilePaused();
             if (!epochIsCurrent(epoch)) {
                 freePacket(packet);
                 break;
@@ -881,7 +947,8 @@ void PlayerSession::videoLoop()
                 handleVideoFrame(frame, epoch);
             }
             if (!gotFrame && packet) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                std::unique_lock<std::mutex> lock(playbackMutex_);
+                playbackCv_.wait_for(lock, std::chrono::milliseconds(2));
             }
         }
 
@@ -900,7 +967,7 @@ void PlayerSession::videoLoop()
 void PlayerSession::audioLoop()
 {
     while (!stopRequested_) {
-        waitIfPaused();
+        waitWhilePaused();
         if (stopRequested_) break;
 
         AVPacket* packet = nullptr;
@@ -929,7 +996,7 @@ void PlayerSession::audioLoop()
         }
 
         while (packet && !stopRequested_) {
-            waitIfPaused();
+            waitWhilePaused();
             if (!epochIsCurrent(epoch)) {
                 freePacket(packet);
                 break;
@@ -949,7 +1016,8 @@ void PlayerSession::audioLoop()
                 av_frame_free(&frame);
             }
             if (!gotFrame && packet) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                std::unique_lock<std::mutex> lock(playbackMutex_);
+                playbackCv_.wait_for(lock, std::chrono::milliseconds(2));
             }
         }
 
@@ -1066,7 +1134,7 @@ void PlayerSession::processAudioFrame(AVFrame* frame, std::uint64_t epoch)
 
     int writeRetries = 0;
     while (!stopRequested_) {
-        waitIfPaused();
+        waitWhilePaused();
         if (!epochIsCurrent(epoch)) {
             // Seek may have flushed mid-write; drop any remainder that still landed.
             if (audioSink_) audioSink_->flush();
@@ -1081,13 +1149,17 @@ void PlayerSession::processAudioFrame(AVFrame* frame, std::uint64_t epoch)
             const MediaTimeMs mediaDuration =
                 static_cast<MediaTimeMs>(samples * 1000LL / kOutputSampleRate);
             audioClockMs_ = base + std::max<MediaTimeMs>(0, mediaDuration);
+            notifyPlayback();
             return;
         }
         if (++writeRetries > 400) {
             // Sink never accepted (e.g. no audio device) — drop without advancing clock.
             return;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        {
+            std::unique_lock<std::mutex> lock(playbackMutex_);
+            playbackCv_.wait_for(lock, std::chrono::milliseconds(5));
+        }
     }
 }
 

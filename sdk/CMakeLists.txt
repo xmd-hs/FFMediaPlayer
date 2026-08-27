@@ -51,7 +51,8 @@ add_library(ffplayer_sdk STATIC
     core/player.cpp
     core/ffmpeg_demuxer.cpp
     core/ffmpeg_decoder.cpp
-    core/audio_tempo.cpp)
+    core/audio_tempo.cpp
+    core/frame_pool.cpp)
 target_sources(ffplayer_sdk PRIVATE core/ffmpeg_subtitle_decoder.cpp)
 target_sources(ffplayer_sdk PRIVATE core/hw_frame_bridge.cpp)
 target_sources(ffplayer_sdk PRIVATE platform/audio_sink.cpp platform/video_sink.cpp)

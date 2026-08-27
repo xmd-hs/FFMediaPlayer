@@ -10,6 +10,8 @@ struct AVBufferRef;
 
 namespace ffplayer {
 
+class AvFramePool;
+
 class FfmpegDecoder {
 public:
     FfmpegDecoder() = default;
@@ -31,6 +33,8 @@ public:
     AVFrame* receive(bool preferHwSurface = false);
     void flush();
     bool sendEndOfStream();
+    void setFramePool(AvFramePool* pool) { framePool_ = pool; }
+    void releaseFrame(AVFrame* frame);
 
     bool hwAccelActive() const { return hwActive_; }
     int hwPixelFormat() const { return hwPixFmt_; }
@@ -46,6 +50,7 @@ private:
     AVBufferRef* hwDeviceCtx_ = nullptr;
     int hwPixFmt_ = -1; // AV_PIX_FMT_NONE
     bool hwActive_ = false;
+    AvFramePool* framePool_ = nullptr;
     std::string lastError_;
 };
 

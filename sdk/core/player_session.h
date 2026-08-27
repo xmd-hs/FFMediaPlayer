@@ -10,6 +10,8 @@
 #include "ffmpeg_decoder.h"
 #include "ffmpeg_subtitle_decoder.h"
 #include "audio_tempo.h"
+#include "frame_pool.h"
+#include <condition_variable>
 
 struct SwrContext;
 struct SwsContext;
@@ -58,7 +60,18 @@ private:
     void audioLoop();
     void processAudioFrame(AVFrame* frame, std::uint64_t epoch);
     void subtitleLoop();
-    void waitIfPaused();
+    void waitWhilePaused();
+    void waitForDemux();
+    void waitForMasterClock(MediaTimeMs targetPts, std::uint64_t epoch);
+    void notifyPlayback();
+    void releaseVideoFrame(AVFrame* frame);
+    bool shouldDropVideoFrame(MediaTimeMs pts, MediaTimeMs master, bool& catchUpMode) const;
+    void signalDecodeError(const std::string& message, std::uint64_t epoch);
+    void pushPipelineEofSentinels(std::uint64_t epoch);
+    bool pushPacket(PacketQueue<AVPacket*>& queue, AVPacket* packet, std::uint64_t epoch);
+    bool pushEofSentinel(PacketQueue<AVPacket*>& queue, std::uint64_t epoch);
+    bool ensureSubtitleThread();
+    bool epochIsCurrent(std::uint64_t epoch) const;
     bool sendPacket(FfmpegDecoder& decoder, AVPacket*& packet, std::mutex& codecMutex,
                     std::uint64_t epoch);
     void presentVideoFrame(AVFrame* frame, MediaTimeMs pts, std::uint64_t epoch);
@@ -71,12 +84,6 @@ private:
     void wakeQueues();
     void beginEofDrain();
     void endEofDrain();
-    void signalDecodeError(const std::string& message, std::uint64_t epoch);
-    void pushPipelineEofSentinels(std::uint64_t epoch);
-    bool pushPacket(PacketQueue<AVPacket*>& queue, AVPacket* packet, std::uint64_t epoch);
-    bool pushEofSentinel(PacketQueue<AVPacket*>& queue, std::uint64_t epoch);
-    bool ensureSubtitleThread();
-    bool epochIsCurrent(std::uint64_t epoch) const;
 
     mutable std::mutex mutex_;
     mutable std::mutex demuxMutex_;
@@ -101,6 +108,11 @@ private:
     int resamplerSrcFormat_ = -1;
     std::uint64_t resamplerSrcLayout_ = 0;
     AudioTempoFilter tempoFilter_;
+    AvFramePool videoFramePool_{12};
+    AvFramePool scalerFramePool_{6};
+    std::mutex playbackMutex_;
+    std::condition_variable playbackCv_;
+    std::atomic_bool videoCatchUp_{false};
     PacketQueue<AVPacket*> videoPackets_{128};
     PacketQueue<AVPacket*> audioPackets_{128};
     PacketQueue<AVPacket*> subtitlePackets_{64};

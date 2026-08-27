@@ -1,4 +1,5 @@
 #include "ffmpeg_decoder.h"
+#include "frame_pool.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -56,12 +57,14 @@ FfmpegDecoder::FfmpegDecoder(FfmpegDecoder&& other) noexcept
     , hwDeviceCtx_(other.hwDeviceCtx_)
     , hwPixFmt_(other.hwPixFmt_)
     , hwActive_(other.hwActive_)
+    , framePool_(other.framePool_)
     , lastError_(std::move(other.lastError_))
 {
     other.context_ = nullptr;
     other.hwDeviceCtx_ = nullptr;
     other.hwPixFmt_ = AV_PIX_FMT_NONE;
     other.hwActive_ = false;
+    other.framePool_ = nullptr;
 }
 
 FfmpegDecoder& FfmpegDecoder::operator=(FfmpegDecoder&& other) noexcept
@@ -72,11 +75,13 @@ FfmpegDecoder& FfmpegDecoder::operator=(FfmpegDecoder&& other) noexcept
         hwDeviceCtx_ = other.hwDeviceCtx_;
         hwPixFmt_ = other.hwPixFmt_;
         hwActive_ = other.hwActive_;
+        framePool_ = other.framePool_;
         lastError_ = std::move(other.lastError_);
         other.context_ = nullptr;
         other.hwDeviceCtx_ = nullptr;
         other.hwPixFmt_ = AV_PIX_FMT_NONE;
         other.hwActive_ = false;
+        other.framePool_ = nullptr;
     }
     return *this;
 }
@@ -236,22 +241,22 @@ int FfmpegDecoder::send(AVPacket* packet)
 
 AVFrame* FfmpegDecoder::transferToSystemMemory(AVFrame* hwFrame)
 {
-    AVFrame* swFrame = av_frame_alloc();
+    AVFrame* swFrame = framePool_ ? framePool_->acquire() : av_frame_alloc();
     if (!swFrame) {
-        av_frame_free(&hwFrame);
+        releaseFrame(hwFrame);
         return nullptr;
     }
     if (av_hwframe_transfer_data(swFrame, hwFrame, 0) < 0) {
-        av_frame_free(&swFrame);
-        av_frame_free(&hwFrame);
+        releaseFrame(swFrame);
+        releaseFrame(hwFrame);
         return nullptr;
     }
     if (av_frame_copy_props(swFrame, hwFrame) < 0) {
-        av_frame_free(&swFrame);
-        av_frame_free(&hwFrame);
+        releaseFrame(swFrame);
+        releaseFrame(hwFrame);
         return nullptr;
     }
-    av_frame_free(&hwFrame);
+    releaseFrame(hwFrame);
     if (swFrame->pts == AV_NOPTS_VALUE) swFrame->pts = swFrame->best_effort_timestamp;
     return swFrame;
 }
@@ -259,10 +264,10 @@ AVFrame* FfmpegDecoder::transferToSystemMemory(AVFrame* hwFrame)
 AVFrame* FfmpegDecoder::receive(bool preferHwSurface)
 {
     if (!context_) return nullptr;
-    AVFrame* frame = av_frame_alloc();
+    AVFrame* frame = framePool_ ? framePool_->acquire() : av_frame_alloc();
     if (!frame) return nullptr;
     if (avcodec_receive_frame(context_, frame) < 0) {
-        av_frame_free(&frame);
+        releaseFrame(frame);
         return nullptr;
     }
     if (frame->pts == AV_NOPTS_VALUE) frame->pts = frame->best_effort_timestamp;
@@ -276,6 +281,13 @@ AVFrame* FfmpegDecoder::receive(bool preferHwSurface)
 void FfmpegDecoder::flush()
 {
     if (context_) avcodec_flush_buffers(context_);
+}
+
+void FfmpegDecoder::releaseFrame(AVFrame* frame)
+{
+    if (!frame) return;
+    if (framePool_) framePool_->release(frame);
+    else av_frame_free(&frame);
 }
 
 bool FfmpegDecoder::sendEndOfStream()
