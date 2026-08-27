@@ -4,9 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <cstring>
 #include <mutex>
-#include <vector>
 
 extern "C" {
 #include <libavutil/channel_layout.h>
@@ -101,8 +99,8 @@ void PlayerSession::processAudioFrame(AVFrame* frame, std::uint64_t epoch)
         : static_cast<std::uint64_t>(frame->ch_layout.nb_channels);
     const double speed = std::max(0.25, std::min(4.0, speed_.load()));
 
-    std::vector<std::uint8_t> pcm;
     int samples = 0;
+    std::int16_t* pcmSamples = nullptr;
     {
         std::lock_guard<std::mutex> lock(resamplerMutex_);
         if (!resampler_ || resamplerSrcRate_ != frame->sample_rate ||
@@ -131,12 +129,16 @@ void PlayerSession::processAudioFrame(AVFrame* frame, std::uint64_t epoch)
             kOutputSampleRate, frame->sample_rate, AV_ROUND_UP);
         if (maxSamples <= 0) return;
 
-        pcm.resize(static_cast<std::size_t>(maxSamples) * kOutputChannels * sizeof(std::int16_t));
-        std::uint8_t* outputData[] = {pcm.data()};
+        // Member scratch: resize only grows capacity after the first frames.
+        audioPcmScratch_.resize(static_cast<std::size_t>(maxSamples) * kOutputChannels);
+        auto* pcmBytes = reinterpret_cast<std::uint8_t*>(audioPcmScratch_.data());
+        std::uint8_t* outputData[] = {pcmBytes};
         samples = swr_convert(
             resampler_, outputData, maxSamples,
             const_cast<const std::uint8_t**>(frame->extended_data), frame->nb_samples);
         if (samples <= 0) return;
+
+        pcmSamples = audioPcmScratch_.data();
 
         if (std::fabs(speed - 1.0) > 1e-3) {
             if (!tempoFilter_.valid() ||
@@ -148,35 +150,34 @@ void PlayerSession::processAudioFrame(AVFrame* frame, std::uint64_t epoch)
                 }
             }
             if (tempoFilter_.valid()) {
-                std::vector<std::int16_t> stretched;
-                const auto* inSamples = reinterpret_cast<const std::int16_t*>(pcm.data());
-                if (tempoFilter_.process(inSamples, samples, stretched) && !stretched.empty()) {
-                    pcm.resize(stretched.size() * sizeof(std::int16_t));
-                    std::memcpy(pcm.data(), stretched.data(), pcm.size());
-                    samples = static_cast<int>(stretched.size() / kOutputChannels);
+                if (tempoFilter_.process(pcmSamples, samples, audioTempoScratch_) &&
+                    !audioTempoScratch_.empty()) {
+                    // Point at tempo output — no second heap buffer / memcpy.
+                    pcmSamples = audioTempoScratch_.data();
+                    samples = static_cast<int>(audioTempoScratch_.size() / kOutputChannels);
                 } else if (std::fabs(speed - 1.0) > 1e-3) {
                     return;
                 }
             }
         }
     }
-    if (samples <= 0) return;
+    if (samples <= 0 || !pcmSamples) return;
 
     const float volume = volume_.load();
     if (volume != 1.0f) {
-        auto* samples16 = reinterpret_cast<std::int16_t*>(pcm.data());
         const int count = samples * kOutputChannels;
         for (int i = 0; i < count; ++i) {
-            const float scaled = static_cast<float>(samples16[i]) * volume;
-            samples16[i] = static_cast<std::int16_t>(
+            const float scaled = static_cast<float>(pcmSamples[i]) * volume;
+            pcmSamples[i] = static_cast<std::int16_t>(
                 std::max(-32768.f, std::min(32767.f, scaled)));
         }
     }
 
     if (!epochIsCurrent(epoch)) return;
 
+    // Sink must copy before return (QtAudioSink does). Scratch is audio-thread-only.
     AudioChunk chunk;
-    chunk.data = pcm.data();
+    chunk.data = reinterpret_cast<const std::uint8_t*>(pcmSamples);
     chunk.size = samples * kOutputChannels * static_cast<int>(sizeof(std::int16_t));
     chunk.sampleRate = kOutputSampleRate;
     chunk.channels = kOutputChannels;

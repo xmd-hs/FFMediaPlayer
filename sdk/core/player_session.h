@@ -12,6 +12,8 @@
 #include "audio_tempo.h"
 #include "frame_pool.h"
 #include <condition_variable>
+#include <cstdint>
+#include <vector>
 
 #ifndef FFPLAYER_ENABLE_HWACCEL
 #define FFPLAYER_ENABLE_HWACCEL 1
@@ -121,6 +123,10 @@ private:
     int resamplerSrcFormat_ = -1;
     std::uint64_t resamplerSrcLayout_ = 0;
     AudioTempoFilter tempoFilter_;
+    // Reused on the audio thread only (avoid per-frame heap alloc).
+    // int16 storage keeps S16 samples naturally aligned for swr/atempo/volume.
+    std::vector<std::int16_t> audioPcmScratch_;
+    std::vector<std::int16_t> audioTempoScratch_;
     AvFramePool videoFramePool_{12};
     AvFramePool scalerFramePool_{6};
     std::mutex playbackMutex_;
