@@ -73,6 +73,40 @@ void PlayerSession::wakeQueues()
     subtitlePackets_.wakeWaiters();
 }
 
+void PlayerSession::beginEofDrain()
+{
+    eofDrainActive_ = true;
+    wakeQueues();
+}
+
+void PlayerSession::endEofDrain()
+{
+    eofDrainActive_ = false;
+}
+
+void PlayerSession::pushPipelineEofSentinels(const std::uint64_t epoch)
+{
+    if (demuxer_.videoStream() >= 0) pushEofSentinel(videoPackets_, epoch);
+    if (demuxer_.audioStream() >= 0) pushEofSentinel(audioPackets_, epoch);
+    if (subtitlePump_.load()) pushEofSentinel(subtitlePackets_, epoch);
+}
+
+void PlayerSession::signalDecodeError(const std::string& message, const std::uint64_t epoch)
+{
+    if (!epochIsCurrent(epoch)) return;
+
+    bool expected = false;
+    if (decodeErrorNotified_.compare_exchange_strong(expected, true)) {
+        if (errorCallback_) errorCallback_(message);
+        setState(PlaybackState::Error);
+    }
+
+    if (!demuxAtEof_.exchange(true)) {
+        beginEofDrain();
+        pushPipelineEofSentinels(epoch);
+    }
+}
+
 bool PlayerSession::epochIsCurrent(std::uint64_t epoch) const
 {
     return epoch == seekEpoch_.load(std::memory_order_acquire);
@@ -106,7 +140,6 @@ bool PlayerSession::pushEofSentinel(PacketQueue<AVPacket*>& queue, std::uint64_t
             if (!epochIsCurrent(epoch) || !demuxAtEof_.load(std::memory_order_acquire)) return false;
             return true;
         }
-        paused_ = false;
         wakeQueues();
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
@@ -135,6 +168,8 @@ bool PlayerSession::open(const std::string& url)
     }
     stopRequested_ = false;
     demuxAtEof_ = false;
+    eofDrainActive_ = false;
+    decodeErrorNotified_ = false;
     subtitlePump_ = false;
     eofWorkers_ = 0;
     finishedNotified_ = false;
@@ -217,6 +252,8 @@ void PlayerSession::close()
     if (subtitleSink_) subtitleSink_->onSubtitleClear();
     demuxer_.close();
     demuxAtEof_ = false;
+    eofDrainActive_ = false;
+    decodeErrorNotified_ = false;
     subtitlePump_ = false;
     eofWorkers_ = 0;
     finishedNotified_ = false;
@@ -290,6 +327,8 @@ bool PlayerSession::seek(MediaTimeMs positionMs)
     // Invalidate EOF before bumping epoch / clearing queues so a late
     // pushEofSentinel cannot inject a live null into the new generation.
     demuxAtEof_ = false;
+    eofDrainActive_ = false;
+    decodeErrorNotified_ = false;
     finishedNotified_ = false;
     eofWorkers_ = 0;
 
@@ -408,7 +447,7 @@ bool PlayerSession::selectSubtitleTrack(int streamIndex)
 
 void PlayerSession::waitIfPaused()
 {
-    while (paused_ && !stopRequested_) {
+    while (paused_ && !eofDrainActive_ && !stopRequested_) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 }
@@ -435,6 +474,27 @@ bool PlayerSession::sendPacket(FfmpegDecoder& decoder, AVPacket*& packet, std::m
         if (result == AVERROR(EAGAIN)) {
             return false;
         }
+
+        // Drain pending frames and retry once before treating as fatal.
+        {
+            std::lock_guard<std::mutex> lock(codecMutex);
+            while (AVFrame* frame = decoder.receive()) {
+                av_frame_free(&frame);
+            }
+            result = decoder.send(packet);
+        }
+        if (result == 0) {
+            av_packet_free(&packet);
+            return true;
+        }
+        if (result == AVERROR(EAGAIN)) {
+            return false;
+        }
+
+        const std::string err = decoder.lastError().empty()
+            ? ("decode send failed: " + std::to_string(result))
+            : decoder.lastError();
+        signalDecodeError(err, epoch);
         av_packet_free(&packet);
         return false;
     }
@@ -460,6 +520,7 @@ void PlayerSession::notifyStreamFinished(std::uint64_t epoch)
         return;
     }
     if (!finishedNotified_.exchange(true)) {
+        endEofDrain();
         paused_ = true;
         clock_.pause();
         // Keep Error if demux already failed; only report Ended for clean EOF.
@@ -537,11 +598,8 @@ void PlayerSession::demuxLoop()
                         continue;
                     }
                     // Unblock consumers so they can observe EOF and exit the decode path.
-                    paused_ = false;
-                    wakeQueues();
-                    if (hasVideo) pushEofSentinel(videoPackets_, epoch);
-                    if (hasAudio) pushEofSentinel(audioPackets_, epoch);
-                    if (subtitlePump_.load()) pushEofSentinel(subtitlePackets_, epoch);
+                    beginEofDrain();
+                    pushPipelineEofSentinels(epoch);
                 }
                 if (!epochIsCurrent(epoch)) continue;
                 if (errorCallback_) errorCallback_(err);
@@ -557,13 +615,11 @@ void PlayerSession::demuxLoop()
                     continue;
                 }
                 // Keep consumers runnable so they can pop EOF sentinels and drain.
-                paused_ = false;
-                wakeQueues();
-                if (hasVideo) pushEofSentinel(videoPackets_, epoch);
-                if (hasAudio) pushEofSentinel(audioPackets_, epoch);
-                if (subtitlePump_.load()) pushEofSentinel(subtitlePackets_, epoch);
+                beginEofDrain();
+                pushPipelineEofSentinels(epoch);
                 if (!hasVideo && !hasAudio && epochIsCurrent(epoch)) {
                     if (!finishedNotified_.exchange(true)) {
+                        endEofDrain();
                         paused_ = true;
                         clock_.pause();
                         setState(PlaybackState::Ended);
@@ -731,6 +787,12 @@ bool PlayerSession::handleVideoFrame(AVFrame* frame, std::uint64_t epoch)
     if (!epochIsCurrent(epoch)) {
         av_frame_free(&frame);
         return false;
+    }
+    // EOF drain while user paused: flush decoder state without presenting.
+    if (paused_.load(std::memory_order_acquire) &&
+        eofDrainActive_.load(std::memory_order_acquire)) {
+        av_frame_free(&frame);
+        return true;
     }
     const MediaTimeMs pts = frame->pts < 0 ? videoClockMs_.load() : frame->pts;
     videoClockMs_ = pts;
@@ -907,6 +969,10 @@ void PlayerSession::audioLoop()
 void PlayerSession::processAudioFrame(AVFrame* frame, std::uint64_t epoch)
 {
     if (!frame || !audioSink_ || !epochIsCurrent(epoch)) return;
+    if (paused_.load(std::memory_order_acquire) &&
+        eofDrainActive_.load(std::memory_order_acquire)) {
+        return;
+    }
 
     const std::uint64_t layoutId = frame->ch_layout.u.mask != 0
         ? frame->ch_layout.u.mask

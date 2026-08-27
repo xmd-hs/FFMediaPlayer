@@ -225,7 +225,13 @@ void FfmpegDecoder::close()
 int FfmpegDecoder::send(AVPacket* packet)
 {
     if (!context_ || !packet) return AVERROR(EINVAL);
-    return avcodec_send_packet(context_, packet);
+    const int result = avcodec_send_packet(context_, packet);
+    if (result < 0 && result != AVERROR(EAGAIN)) {
+        lastError_ = "send packet failed: " + errorText(result);
+    } else if (result >= 0) {
+        lastError_.clear();
+    }
+    return result;
 }
 
 AVFrame* FfmpegDecoder::transferToSystemMemory(AVFrame* hwFrame)

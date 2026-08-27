@@ -69,6 +69,10 @@ private:
     void resetResampler();
     void resetScaler();
     void wakeQueues();
+    void beginEofDrain();
+    void endEofDrain();
+    void signalDecodeError(const std::string& message, std::uint64_t epoch);
+    void pushPipelineEofSentinels(std::uint64_t epoch);
     bool pushPacket(PacketQueue<AVPacket*>& queue, AVPacket* packet, std::uint64_t epoch);
     bool pushEofSentinel(PacketQueue<AVPacket*>& queue, std::uint64_t epoch);
     bool ensureSubtitleThread();
@@ -107,6 +111,8 @@ private:
     std::atomic_bool stopRequested_{false};
     std::atomic_bool paused_{true};
     std::atomic_bool demuxAtEof_{false};
+    std::atomic_bool eofDrainActive_{false};
+    std::atomic_bool decodeErrorNotified_{false};
     std::atomic_bool subtitlePump_{false};
     std::atomic<std::uint64_t> seekEpoch_{0};
     IVideoSink* videoSink_ = nullptr;
